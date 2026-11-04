@@ -2,3 +2,6 @@ html
 latex
 
 bazel-*
+zig-out
+.zig-cache
+

@@ -471,6 +471,10 @@ Result<void> NvencVideoEncoder::EncodeInner(
 
   webrtc::CodecSpecificInfo codec_specific = {};
   codec_specific.codecType = config_.webrtc_codec_type;
+  if (config_.webrtc_codec_type == webrtc::kVideoCodecH264) {
+    codec_specific.codecSpecific.H264.packetization_mode =
+        webrtc::H264PacketizationMode::NonInterleaved;
+  }
 
   callback_->OnEncodedImage(encoded_image, &codec_specific);
 

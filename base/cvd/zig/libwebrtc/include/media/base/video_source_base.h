@@ -1,0 +1,36 @@
+#pragma once
+
+#include <mutex>
+#include <vector>
+
+#include "api/video/video_frame.h"
+#include "api/video/video_sink_interface.h"
+#include "api/video/video_source_interface.h"
+
+namespace rtc {
+
+class VideoSourceBase : public VideoSourceInterface<webrtc::VideoFrame> {
+ public:
+  VideoSourceBase();
+  ~VideoSourceBase() override;
+
+  void AddOrUpdateSink(VideoSinkInterface<webrtc::VideoFrame>* sink,
+                       const VideoSinkWants& wants) override;
+  void RemoveSink(VideoSinkInterface<webrtc::VideoFrame>* sink) override;
+
+ protected:
+  struct SinkPair {
+    SinkPair(VideoSinkInterface<webrtc::VideoFrame>* sink, VideoSinkWants wants)
+        : sink(sink), wants(wants) {}
+    VideoSinkInterface<webrtc::VideoFrame>* sink;
+    VideoSinkWants wants;
+  };
+
+  SinkPair* FindSinkPair(const VideoSinkInterface<webrtc::VideoFrame>* sink);
+  const std::vector<SinkPair>& sink_pairs() const { return sinks_; }
+
+  mutable std::mutex sinks_mu_;
+  std::vector<SinkPair> sinks_;
+};
+
+}  // namespace rtc

@@ -32,7 +32,7 @@ namespace webrtc_streaming {
 
 namespace {
 
-// Software fallback encoder (VP8 only via libvpx).
+// Software fallback encoder (VP8 via libvpx and H.264 via OpenH264).
 class BuiltinEncoderProvider : public EncoderProvider {
  public:
   BuiltinEncoderProvider()
@@ -48,7 +48,7 @@ class BuiltinEncoderProvider : public EncoderProvider {
     std::vector<webrtc::SdpVideoFormat> result;
     for (const webrtc::SdpVideoFormat& format :
          factory_->GetSupportedFormats()) {
-      if (format.name == "VP8") {
+      if (format.name == "VP8" || format.name == "H264") {
         result.push_back(format);
       }
     }
