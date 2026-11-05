@@ -297,15 +297,17 @@ class DeviceConnection {
           if (img.naturalWidth > 0 && img.naturalHeight > 0) {
             this.#displayState.remoteImage = img;
             this.#displayState.hasRemoteFrames = true;
+            renderFrame();
           }
         };
         img.onerror = () => {
           frameLoadInFlight = false;
         };
-        img.src = `/live_frame.png?t=${Date.now()}`;
+        img.src = `/live_frame.png?t=${performance.now()}`;
       };
+      this.#displayState.pollLiveFrame = pollLiveFrame;
       pollLiveFrame();
-      setInterval(pollLiveFrame, 200);
+      setInterval(pollLiveFrame, 45);
 
       const renderFrame = () => {
         this.#displayState.frameCount += 1;
@@ -539,11 +541,19 @@ class DeviceConnection {
             device_label: device_label,
           };
     this.#sendJsonInput(events);
+    if (!down && this.#displayState.pollLiveFrame) {
+      setTimeout(this.#displayState.pollLiveFrame, 25);
+      setTimeout(this.#displayState.pollLiveFrame, 60);
+    }
   }
 
   sendKeyEvent(code, type) {
     this.#displayState.lastAction = `key ${code} (${type})`;
     this.#sendJsonInput({type: 'keyboard', keycode: code, event_type: type});
+    if (this.#displayState.pollLiveFrame) {
+      setTimeout(this.#displayState.pollLiveFrame, 25);
+      setTimeout(this.#displayState.pollLiveFrame, 60);
+    }
   }
 
   sendWheelEvent(pixels) {
