@@ -48,6 +48,7 @@ pub fn addLibWebRtcAt(
     };
 
     const c_lib_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}root.zig", .{dir_prefix})),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -58,7 +59,6 @@ pub fn addLibWebRtcAt(
     c_lib_mod.addCSourceFiles(.{
         .files = &.{
             b.fmt("{s}csrc/slim_webrtc_core.cpp", .{dir_prefix}),
-            b.fmt("{s}webrtc_c.cpp", .{dir_prefix}),
             b.fmt("{s}stubs/audio_processing_stub.cc", .{dir_prefix}),
             b.fmt("{s}stubs/h264_decoder_stub.cc", .{dir_prefix}),
         },
@@ -76,22 +76,18 @@ pub fn addLibWebRtcAt(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .link_libcpp = true,
     });
     mod.addIncludePath(include_path);
     mod.addIncludePath(self_path);
-    mod.linkLibrary(lib);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path(b.fmt("{s}root.zig", .{dir_prefix})),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .link_libcpp = true,
     });
     test_mod.addIncludePath(include_path);
     test_mod.addIncludePath(self_path);
-    test_mod.linkLibrary(lib);
 
     const unit_tests = b.addTest(.{
         .name = "libwebrtc_tests",
