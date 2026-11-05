@@ -283,6 +283,8 @@ class DeviceConnection {
       const canvas = document.createElement('canvas');
       canvas.width = width;
       canvas.height = height;
+      this.#displayState.canvasWidth = width;
+      this.#displayState.canvasHeight = height;
       const ctx = canvas.getContext('2d');
 
       let frameLoadInFlight = false;
@@ -511,6 +513,16 @@ class DeviceConnection {
   // TODO (b/124121375): This should probably be an array of pointer events and
   // have different properties.
   sendMultiTouch({idArr, xArr, yArr, down, device_label}) {
+    let scaledX = xArr;
+    let scaledY = yArr;
+    const img = this.#displayState.remoteImage;
+    const cw = this.#displayState.canvasWidth || 0;
+    const ch = this.#displayState.canvasHeight || 0;
+    if (img && img.naturalWidth > 0 && img.naturalHeight > 0 && cw > 0 && ch > 0 &&
+        (cw !== img.naturalWidth || ch !== img.naturalHeight)) {
+      scaledX = (xArr || []).map(x => Math.round(x * img.naturalWidth / cw));
+      scaledY = (yArr || []).map(y => Math.round(y * img.naturalHeight / ch));
+    }
     if (xArr && xArr.length > 0 && yArr && yArr.length > 0) {
       this.#displayState.touchX = xArr[0];
       this.#displayState.touchY = yArr[0];
@@ -521,8 +533,8 @@ class DeviceConnection {
     let events = {
             type: 'multi-touch',
             id: idArr,
-            x: xArr,
-            y: yArr,
+            x: scaledX,
+            y: scaledY,
             down: down ? 1 : 0,
             device_label: device_label,
           };

@@ -214,6 +214,15 @@ class OperatorConnector {
       );
       return;
     }
+    if (this.#connId === null) {
+      try {
+        const resolvedDeviceId = await this.#resolveDeviceId('cf0');
+        await this.#requestViaPolling(resolvedDeviceId);
+      } catch (e) {
+        console.warn('Auto-reconnect polling failed:', e);
+        return;
+      }
+    }
     if (this.#connId !== null) {
       const msgs = await ajaxPostJson(httpUrl('forward'), {
         connection_id: this.#connId,

@@ -42,7 +42,7 @@ async function ConnectDevice(deviceId, serverConnector) {
     }
   }, intervalMs);
 
-  let module = await import('./cf_webrtc.js?v=2');
+  let module = await import('./cf_webrtc.js?v=3');
   let deviceConnection = await module.Connect(deviceId, serverConnector);
   console.info('Connected to ' + deviceId);
   clearInterval(connectionInterval);
@@ -1293,7 +1293,7 @@ class DeviceControlApp {
 window.addEventListener("load", async evt => {
   try {
     setupMessages();
-    let connectorModule = await import('./server_connector.js?v=2');
+    let connectorModule = await import('./server_connector.js?v=3');
     let deviceId = connectorModule.deviceId();
     document.title = deviceId;
     let deviceConnection =

@@ -83,7 +83,7 @@
             if (!devId) return;
             const link = document.createElement('a');
             link.className = 'device-btn';
-            link.href = `/client.html?v=2&deviceId=${encodeURIComponent(devId)}`;
+            link.href = `/client.html?v=3&deviceId=${encodeURIComponent(devId)}`;
             link.textContent = devId;
             link.addEventListener('click', (evt) => {
               evt.preventDefault();
