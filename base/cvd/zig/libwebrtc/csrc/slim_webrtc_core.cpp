@@ -43,6 +43,7 @@
 #include "modules/video_coding/codecs/h264/include/h264_globals.h"
 #include "modules/video_coding/codecs/vp8/include/vp8_globals.h"
 #include "modules/video_coding/include/video_codec_interface.h"
+#include "webrtc_c.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "pc/video_track_source.h"
 #include "rtc_base/checks.h"
@@ -1604,21 +1605,26 @@ std::atomic<uint64_t> g_next_peer_id{1};
 std::map<uint64_t, SlimPeerConnection*> g_peer_registry;
 
 absl::optional<uint64_t> ParsePeerIdFromSdp(const std::string& sdp) {
-  const std::string marker = "a=ice-ufrag:slim-peer-";
-  auto pos = sdp.find(marker);
-  if (pos == std::string::npos) {
-    return absl::nullopt;
+  for (const char* prefix : {"a=ice-ufrag:zig-ufrag-", "a=ice-ufrag:slim-peer-"}) {
+    const std::string marker(prefix);
+    auto pos = sdp.find(marker);
+    if (pos == std::string::npos) {
+      continue;
+    }
+    pos += marker.size();
+    uint64_t id = 0;
+    bool any = false;
+    while (pos < sdp.size() &&
+           std::isdigit(static_cast<unsigned char>(sdp[pos]))) {
+      any = true;
+      id = id * 10 + static_cast<uint64_t>(sdp[pos] - '0');
+      ++pos;
+    }
+    if (any) {
+      return id;
+    }
   }
-  pos += marker.size();
-  uint64_t id = 0;
-  bool any = false;
-  while (pos < sdp.size() &&
-         std::isdigit(static_cast<unsigned char>(sdp[pos]))) {
-    any = true;
-    id = id * 10 + static_cast<uint64_t>(sdp[pos] - '0');
-    ++pos;
-  }
-  return any ? absl::optional<uint64_t>(id) : absl::nullopt;
+  return absl::nullopt;
 }
 
 class SlimPeerConnection : public PeerConnectionInterface {
@@ -1628,12 +1634,28 @@ class SlimPeerConnection : public PeerConnectionInterface {
       : config_(config),
         observer_(observer),
         peer_id_(g_next_peer_id.fetch_add(1, std::memory_order_relaxed)) {
+    zig_factory_ = cf_webrtc_factory_create();
+    if (zig_factory_) {
+      cf_webrtc_pc_config_t c_cfg{};
+      c_cfg.min_port = config.min_port() > 0 ? static_cast<uint16_t>(config.min_port()) : 15550;
+      c_cfg.max_port = config.max_port() > 0 ? static_cast<uint16_t>(config.max_port()) : 15599;
+      c_cfg.stun_server_uri = nullptr;
+      zig_pc_ = cf_webrtc_pc_create(zig_factory_, &c_cfg, nullptr);
+    }
     std::lock_guard<std::mutex> lock(g_peer_registry_mu);
     g_peer_registry[peer_id_] = this;
   }
 
   ~SlimPeerConnection() override {
     Close();
+    if (zig_pc_) {
+      cf_webrtc_pc_destroy(zig_pc_);
+      zig_pc_ = nullptr;
+    }
+    if (zig_factory_) {
+      cf_webrtc_factory_destroy(zig_factory_);
+      zig_factory_ = nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_peer_registry_mu);
     g_peer_registry.erase(peer_id_);
   }
@@ -1874,7 +1896,29 @@ class SlimPeerConnection : public PeerConnectionInterface {
   }
 
  private:
+  static void CaptureZigSdpCallback(void* user_data,
+                                    cf_webrtc_sdp_type_t sdp_type,
+                                    const char* sdp,
+                                    size_t sdp_len) {
+    (void)sdp_type;
+    if (!user_data || !sdp || sdp_len == 0) {
+      return;
+    }
+    auto* out = static_cast<std::string*>(user_data);
+    out->assign(sdp, sdp_len);
+  }
+
   std::string BuildSdp(SdpType type) const {
+    if (zig_pc_) {
+      std::string zig_sdp;
+      cf_webrtc_error_t rc =
+          (type == SdpType::kAnswer)
+              ? cf_webrtc_pc_create_answer(zig_pc_, &CaptureZigSdpCallback, &zig_sdp)
+              : cf_webrtc_pc_create_offer(zig_pc_, &CaptureZigSdpCallback, &zig_sdp);
+      if (rc == CF_WEBRTC_OK && !zig_sdp.empty()) {
+        return zig_sdp;
+      }
+    }
     std::ostringstream oss;
     oss << "v=0\r\n"
         << "o=- " << (100000 + peer_id_) << " 2 IN IP4 127.0.0.1\r\n"
@@ -1919,6 +1963,13 @@ class SlimPeerConnection : public PeerConnectionInterface {
 
   void ApplyLocalDescription(std::unique_ptr<SessionDescriptionInterface> desc) {
     SdpType type = desc->GetType();
+    std::string sdp;
+    desc->ToString(&sdp);
+    if (zig_pc_ && !sdp.empty()) {
+      cf_webrtc_sdp_type_t c_type =
+          (type == SdpType::kAnswer) ? CF_WEBRTC_SDP_ANSWER : CF_WEBRTC_SDP_OFFER;
+      cf_webrtc_pc_set_local_description(zig_pc_, c_type, sdp.data(), sdp.size());
+    }
     local_desc_ = std::move(desc);
     if (type == SdpType::kOffer) {
       signaling_state_ = kHaveLocalOffer;
@@ -1935,6 +1986,11 @@ class SlimPeerConnection : public PeerConnectionInterface {
     SdpType type = desc->GetType();
     std::string sdp;
     desc->ToString(&sdp);
+    if (zig_pc_ && !sdp.empty()) {
+      cf_webrtc_sdp_type_t c_type =
+          (type == SdpType::kAnswer) ? CF_WEBRTC_SDP_ANSWER : CF_WEBRTC_SDP_OFFER;
+      cf_webrtc_pc_set_remote_description(zig_pc_, c_type, sdp.data(), sdp.size());
+    }
     remote_desc_ = std::move(desc);
 
     if (auto remote_id = ParsePeerIdFromSdp(sdp)) {
@@ -2044,6 +2100,8 @@ class SlimPeerConnection : public PeerConnectionInterface {
   RTCConfiguration config_;
   PeerConnectionObserver* observer_;
   uint64_t peer_id_;
+  cf_webrtc_factory_t* zig_factory_ = nullptr;
+  cf_webrtc_pc_t* zig_pc_ = nullptr;
   SlimPeerConnection* paired_peer_ = nullptr;
 
   SignalingState signaling_state_ = kStable;
