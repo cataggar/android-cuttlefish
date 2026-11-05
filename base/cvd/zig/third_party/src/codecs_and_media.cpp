@@ -1043,20 +1043,37 @@ vpx_codec_err_t vpx_codec_encode(vpx_codec_ctx_t* ctx, const vpx_image_t* img,
     return VPX_CODEC_OK;
   }
   bool is_key = (priv->frame_count == 0) || ((flags & VPX_EFLAG_FORCE_KF) != 0);
-  priv->pkt_buf.resize(16);
-  // Minimal valid-looking VP8/VP9 frame header + dimensions
-  priv->pkt_buf[0] = is_key ? 0x10 : 0x11;
-  priv->pkt_buf[1] = 0x00;
-  priv->pkt_buf[2] = 0x00;
-  priv->pkt_buf[3] = 0x9d;
-  priv->pkt_buf[4] = 0x01;
-  priv->pkt_buf[5] = 0x2a;
-  priv->pkt_buf[6] = static_cast<uint8_t>(img->d_w & 0xFF);
-  priv->pkt_buf[7] = static_cast<uint8_t>((img->d_w >> 8) & 0x3F);
-  priv->pkt_buf[8] = static_cast<uint8_t>(img->d_h & 0xFF);
-  priv->pkt_buf[9] = static_cast<uint8_t>((img->d_h >> 8) & 0x3F);
+  unsigned int w = img->d_w > 0 ? img->d_w : priv->width;
+  unsigned int h = img->d_h > 0 ? img->d_h : priv->height;
+  uint32_t frame_tag = (19u << 5) | (1u << 4) | (is_key ? 0u : 1u);
+  priv->pkt_buf.clear();
+  priv->pkt_buf.push_back(static_cast<uint8_t>(frame_tag & 0xFF));
+  priv->pkt_buf.push_back(static_cast<uint8_t>((frame_tag >> 8) & 0xFF));
+  priv->pkt_buf.push_back(static_cast<uint8_t>((frame_tag >> 16) & 0xFF));
+  priv->pkt_buf.push_back(0x9d);
+  priv->pkt_buf.push_back(0x01);
+  priv->pkt_buf.push_back(0x2a);
+  priv->pkt_buf.push_back(static_cast<uint8_t>(w & 0xFF));
+  priv->pkt_buf.push_back(static_cast<uint8_t>((w >> 8) & 0x3F));
+  priv->pkt_buf.push_back(static_cast<uint8_t>(h & 0xFF));
+  priv->pkt_buf.push_back(static_cast<uint8_t>((h >> 8) & 0x3F));
   if (img->planes[VPX_PLANE_Y]) {
-    priv->pkt_buf[10] = img->planes[VPX_PLANE_Y][0];
+    unsigned int rows = std::min(h, 8u);
+    unsigned int cols = std::min(w, 16u);
+    for (unsigned int y = 0; y < rows; ++y) {
+      for (unsigned int x = 0; x < cols; ++x) {
+        uint8_t yv = img->planes[VPX_PLANE_Y][y * img->stride[VPX_PLANE_Y] + x];
+        uint8_t uv = img->planes[VPX_PLANE_U]
+                         ? img->planes[VPX_PLANE_U][(y / 2) * img->stride[VPX_PLANE_U] + (x / 2)]
+                         : 128;
+        uint8_t vv = img->planes[VPX_PLANE_V]
+                         ? img->planes[VPX_PLANE_V][(y / 2) * img->stride[VPX_PLANE_V] + (x / 2)]
+                         : 128;
+        priv->pkt_buf.push_back(static_cast<uint8_t>(yv ^ uv ^ vv));
+      }
+    }
+  } else {
+    priv->pkt_buf.push_back(0x00);
   }
 
   std::memset(&priv->pkt, 0, sizeof(priv->pkt));
@@ -1172,6 +1189,91 @@ vpx_codec_err_t vpx_codec_control_(vpx_codec_ctx_t* ctx, int ctrl_id, ...) {
 // ============================================================================
 namespace {
 
+class H264SvcBitWriter {
+ public:
+  void WriteBit(uint8_t b) {
+    cur_byte_ = static_cast<uint8_t>((cur_byte_ << 1) | (b & 1));
+    bit_count_++;
+    if (bit_count_ == 8) {
+      bytes_.push_back(cur_byte_);
+      cur_byte_ = 0;
+      bit_count_ = 0;
+    }
+  }
+
+  void WriteBits(uint32_t val, int count) {
+    for (int i = count - 1; i >= 0; --i) {
+      WriteBit(static_cast<uint8_t>((val >> i) & 1));
+    }
+  }
+
+  void WriteUe(uint32_t val) {
+    uint32_t code_num = val + 1;
+    int leading_zeros = 0;
+    uint32_t tmp = code_num;
+    while (tmp > 1) {
+      tmp >>= 1;
+      leading_zeros++;
+    }
+    for (int i = 0; i < leading_zeros; ++i) {
+      WriteBit(0);
+    }
+    WriteBits(code_num, leading_zeros + 1);
+  }
+
+  void WriteSe(int32_t val) {
+    uint32_t code_num = (val <= 0) ? static_cast<uint32_t>(-2 * val)
+                                   : static_cast<uint32_t>(2 * val - 1);
+    WriteUe(code_num);
+  }
+
+  void AlignToByteWithZero() {
+    while (bit_count_ != 0) {
+      WriteBit(0);
+    }
+  }
+
+  void WriteRawByte(uint8_t b) { bytes_.push_back(b); }
+
+  void WriteRbspTrailingBits() {
+    WriteBit(1);
+    while (bit_count_ != 0) {
+      WriteBit(0);
+    }
+  }
+
+  const std::vector<uint8_t>& bytes() const { return bytes_; }
+
+ private:
+  std::vector<uint8_t> bytes_;
+  uint8_t cur_byte_ = 0;
+  int bit_count_ = 0;
+};
+
+int AppendAnnexBNal(std::vector<uint8_t>* out, uint8_t nal_header,
+                    const std::vector<uint8_t>& rbsp) {
+  size_t before = out->size();
+  out->push_back(0x00);
+  out->push_back(0x00);
+  out->push_back(0x00);
+  out->push_back(0x01);
+  out->push_back(nal_header);
+  int zero_run = 0;
+  for (uint8_t b : rbsp) {
+    if (zero_run >= 2 && b <= 0x03) {
+      out->push_back(0x03);
+      zero_run = 0;
+    }
+    out->push_back(b);
+    if (b == 0x00) {
+      zero_run++;
+    } else {
+      zero_run = 0;
+    }
+  }
+  return static_cast<int>(out->size() - before);
+}
+
 class SlimSVCEncoder : public ISVCEncoder {
  public:
   SlimSVCEncoder() { bitstream_.resize(64, 0); }
@@ -1223,20 +1325,127 @@ class SlimSVCEncoder : public ISVCEncoder {
     bool is_idr = (frame_idx_ == 0) || force_idr_;
     force_idr_ = false;
 
-    // Construct Annex-B NAL unit(s)
-    // Start code 00 00 00 01 + SPS(0x67) + PPS(0x68) + IDR(0x65) or P-slice(0x41)
-    static const uint8_t kIdrStream[] = {
-        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e,
-        0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,
-        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21};
-    static const uint8_t kPStream[] = {0x00, 0x00, 0x00, 0x01,
-                                       0x41, 0x9a, 0x24, 0x6c};
+    int w = kpSrcPic->iPicWidth > 0 ? kpSrcPic->iPicWidth : width_;
+    int h = kpSrcPic->iPicHeight > 0 ? kpSrcPic->iPicHeight : height_;
+    w = std::max(w, 2);
+    h = std::max(h, 2);
+    uint32_t mb_width = static_cast<uint32_t>((w + 15) / 16);
+    uint32_t mb_height = static_cast<uint32_t>((h + 15) / 16);
+    uint32_t padded_w = mb_width * 16;
+    uint32_t padded_h = mb_height * 16;
+    uint32_t crop_right = (padded_w - static_cast<uint32_t>(w)) / 2;
+    uint32_t crop_bottom = (padded_h - static_cast<uint32_t>(h)) / 2;
+
+    bitstream_.clear();
 
     if (is_idr) {
-      bitstream_.assign(std::begin(kIdrStream), std::end(kIdrStream));
-      nal_lengths_[0] = 8;
-      nal_lengths_[1] = 8;
-      nal_lengths_[2] = 8;
+      H264SvcBitWriter sps;
+      sps.WriteBits(66, 8);
+      sps.WriteBits(0x80, 8);
+      sps.WriteBits(31, 8);
+      sps.WriteUe(0);
+      sps.WriteUe(0);
+      sps.WriteUe(2);
+      sps.WriteUe(0);
+      sps.WriteBit(0);
+      sps.WriteUe(mb_width - 1);
+      sps.WriteUe(mb_height - 1);
+      sps.WriteBit(1);
+      sps.WriteBit(1);
+      if (crop_right > 0 || crop_bottom > 0) {
+        sps.WriteBit(1);
+        sps.WriteUe(0);
+        sps.WriteUe(crop_right);
+        sps.WriteUe(0);
+        sps.WriteUe(crop_bottom);
+      } else {
+        sps.WriteBit(0);
+      }
+      sps.WriteBit(0);
+      sps.WriteRbspTrailingBits();
+      nal_lengths_[0] = AppendAnnexBNal(&bitstream_, 0x67, sps.bytes());
+
+      H264SvcBitWriter pps;
+      pps.WriteUe(0);
+      pps.WriteUe(0);
+      pps.WriteBit(0);
+      pps.WriteBit(0);
+      pps.WriteUe(0);
+      pps.WriteUe(0);
+      pps.WriteUe(0);
+      pps.WriteBit(0);
+      pps.WriteBits(0, 2);
+      pps.WriteSe(0);
+      pps.WriteSe(0);
+      pps.WriteSe(0);
+      pps.WriteBit(1);
+      pps.WriteBit(0);
+      pps.WriteBit(0);
+      pps.WriteRbspTrailingBits();
+      nal_lengths_[1] = AppendAnnexBNal(&bitstream_, 0x68, pps.bytes());
+    }
+
+    H264SvcBitWriter slice;
+    slice.WriteUe(0);
+    slice.WriteUe(7);
+    slice.WriteUe(0);
+    slice.WriteBits(static_cast<uint32_t>(frame_idx_ & 0x0F), 4);
+    if (is_idr) {
+      slice.WriteUe(static_cast<uint32_t>(frame_idx_ & 0xFF));
+    }
+    slice.WriteBit(0);
+    if (is_idr) {
+      slice.WriteBit(0);
+    }
+    slice.WriteSe(0);
+    slice.WriteUe(1);
+
+    uint32_t total_mbs = mb_width * mb_height;
+    uint32_t emit_mbs = std::min(total_mbs, 256u);
+    int cw = (w + 1) / 2;
+    int ch = (h + 1) / 2;
+    const uint8_t* y_plane = kpSrcPic->pData[0];
+    const uint8_t* u_plane = kpSrcPic->pData[1];
+    const uint8_t* v_plane = kpSrcPic->pData[2];
+    int y_stride = kpSrcPic->iStride[0] > 0 ? kpSrcPic->iStride[0] : w;
+    int u_stride = kpSrcPic->iStride[1] > 0 ? kpSrcPic->iStride[1] : cw;
+    int v_stride = kpSrcPic->iStride[2] > 0 ? kpSrcPic->iStride[2] : cw;
+
+    for (uint32_t mb_idx = 0; mb_idx < emit_mbs; ++mb_idx) {
+      uint32_t mb_y = mb_idx / mb_width;
+      uint32_t mb_x = mb_idx % mb_width;
+      slice.WriteUe(25);
+      slice.AlignToByteWithZero();
+
+      for (uint32_t dy = 0; dy < 16; ++dy) {
+        int py = std::min(static_cast<int>(mb_y * 16 + dy), h - 1);
+        for (uint32_t dx = 0; dx < 16; ++dx) {
+          int px = std::min(static_cast<int>(mb_x * 16 + dx), w - 1);
+          uint8_t s = y_plane ? y_plane[py * y_stride + px] : 128;
+          slice.WriteRawByte(s);
+        }
+      }
+      for (uint32_t dy = 0; dy < 8; ++dy) {
+        int py = std::min(static_cast<int>(mb_y * 8 + dy), ch - 1);
+        for (uint32_t dx = 0; dx < 8; ++dx) {
+          int px = std::min(static_cast<int>(mb_x * 8 + dx), cw - 1);
+          uint8_t s = u_plane ? u_plane[py * u_stride + px] : 128;
+          slice.WriteRawByte(s);
+        }
+      }
+      for (uint32_t dy = 0; dy < 8; ++dy) {
+        int py = std::min(static_cast<int>(mb_y * 8 + dy), ch - 1);
+        for (uint32_t dx = 0; dx < 8; ++dx) {
+          int px = std::min(static_cast<int>(mb_x * 8 + dx), cw - 1);
+          uint8_t s = v_plane ? v_plane[py * v_stride + px] : 128;
+          slice.WriteRawByte(s);
+        }
+      }
+    }
+    slice.WriteRbspTrailingBits();
+
+    if (is_idr) {
+      nal_lengths_[2] = AppendAnnexBNal(&bitstream_, 0x65, slice.bytes());
       pBsInfo->eFrameType = videoFrameTypeIDR;
       pBsInfo->iLayerNum = 1;
       pBsInfo->sLayerInfo[0].uiLayerType = VIDEO_CODING_LAYER;
@@ -1245,8 +1454,7 @@ class SlimSVCEncoder : public ISVCEncoder {
       pBsInfo->sLayerInfo[0].pNalLengthInByte = nal_lengths_;
       pBsInfo->sLayerInfo[0].pBsBuf = bitstream_.data();
     } else {
-      bitstream_.assign(std::begin(kPStream), std::end(kPStream));
-      nal_lengths_[0] = 8;
+      nal_lengths_[0] = AppendAnnexBNal(&bitstream_, 0x41, slice.bytes());
       pBsInfo->eFrameType = videoFrameTypeP;
       pBsInfo->iLayerNum = 1;
       pBsInfo->sLayerInfo[0].uiLayerType = VIDEO_CODING_LAYER;

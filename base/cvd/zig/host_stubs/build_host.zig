@@ -1,5 +1,10 @@
 const std = @import("std");
 
+fn detectBasePrefix(b: *std.Build) []const u8 {
+    b.build_root.handle.access("base/cvd/zig/host_stubs/webrtc_host_stubs.cpp", .{}) catch return "";
+    return "base/cvd/";
+}
+
 pub fn addWebRtcHostBinary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -8,7 +13,33 @@ pub fn addWebRtcHostBinary(
     libwebrtc_include: std.Build.LazyPath,
     third_party_lib: *std.Build.Step.Compile,
     third_party_include: std.Build.LazyPath,
+    streamer_shim_lib: *std.Build.Step.Compile,
 ) *std.Build.Step.Compile {
+    return addWebRtcHostBinaryWithPrefix(
+        b,
+        target,
+        optimize,
+        libwebrtc_lib,
+        libwebrtc_include,
+        third_party_lib,
+        third_party_include,
+        streamer_shim_lib,
+        detectBasePrefix(b),
+    );
+}
+
+pub fn addWebRtcHostBinaryWithPrefix(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    libwebrtc_lib: *std.Build.Step.Compile,
+    libwebrtc_include: std.Build.LazyPath,
+    third_party_lib: *std.Build.Step.Compile,
+    third_party_include: std.Build.LazyPath,
+    streamer_shim_lib: *std.Build.Step.Compile,
+    base_prefix: []const u8,
+) *std.Build.Step.Compile {
+    const os_define: []const u8 = if (target.result.os.tag == .macos) "-DWEBRTC_MAC" else "-DWEBRTC_LINUX";
     const cpp_flags: []const []const u8 = &.{
         "-std=c++20",
         "-Wno-unused-parameter",
@@ -16,7 +47,7 @@ pub fn addWebRtcHostBinary(
         "-Wno-missing-field-initializers",
         "-Wno-deprecated-declarations",
         "-DWEBRTC_POSIX",
-        "-DWEBRTC_LINUX",
+        os_define,
         "-DWEBRTC_HAVE_SCTP",
         "-DWEBRTC_HAVE_DCSCTP",
         "-DWEBRTC_CODEC_OPUS",
@@ -32,14 +63,18 @@ pub fn addWebRtcHostBinary(
         .link_libcpp = true,
     });
 
+    const cvd_root_path = if (base_prefix.len == 0) "." else std.mem.trimEnd(u8, base_prefix, "/");
+    const cvd_root = b.path(cvd_root_path);
+
     // Include paths: pregenerated_protos first (for generated .pb.h and slim confui override),
     // then third_party, libwebrtc, and base/cvd root.
-    host_mod.addIncludePath(b.path("zig/host_stubs/pregenerated_protos"));
+    host_mod.addIncludePath(b.path(b.fmt("{s}zig/host_stubs/pregenerated_protos", .{base_prefix})));
     host_mod.addIncludePath(third_party_include);
     host_mod.addIncludePath(libwebrtc_include);
-    host_mod.addIncludePath(b.path("."));
+    host_mod.addIncludePath(cvd_root);
 
     host_mod.addCSourceFiles(.{
+        .root = cvd_root,
         .files = &.{
             // Core result, ansi_codes, posix, io, files, process, flag_parser
             "cuttlefish/result/error_type.cc",
@@ -214,6 +249,7 @@ pub fn addWebRtcHostBinary(
 
     host_mod.linkLibrary(libwebrtc_lib);
     host_mod.linkLibrary(third_party_lib);
+    host_mod.linkLibrary(streamer_shim_lib);
 
     return b.addExecutable(.{
         .name = "webrtc",

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 // Signaling field keys matching cuttlefish/host/frontend/webrtc_operator/constants/signaling_constants.h
@@ -426,3 +427,458 @@ pub fn parsePollMessagesHttpBody(allocator: Allocator, raw_json: []const u8) ![]
     };
     return try allocator.dupe(u8, conn_str);
 }
+
+pub const os_socket = struct {
+    pub const is_linux = builtin.os.tag == .linux;
+    const linux = std.os.linux;
+
+    pub const PATH_MAX: usize = if (is_linux) linux.PATH_MAX else 1024;
+    pub const MAX_UNIX_SOCKET_PATH: usize = if (is_linux) 108 else 104;
+
+    pub const AF_UNIX: i32 = 1;
+    pub const AF_INET: i32 = 2;
+    pub const SOCK_STREAM: i32 = 1;
+    pub const SOCK_SEQPACKET: i32 = 5;
+
+    pub const SOL_SOCKET: i32 = if (is_linux) linux.SOL.SOCKET else 0xffff;
+    pub const SO_REUSEADDR: i32 = if (is_linux) linux.SO.REUSEADDR else 0x0004;
+    pub const SO_NOSIGPIPE: i32 = 0x1022;
+
+    pub const POLLIN: i16 = 0x0001;
+    pub const POLLERR: i16 = 0x0008;
+    pub const POLLHUP: i16 = 0x0010;
+    pub const POLLNVAL: i16 = 0x0020;
+
+    pub const SockAddrIn = if (is_linux)
+        linux.sockaddr.in
+    else
+        extern struct {
+            len: u8 = @sizeOf(@This()),
+            family: u8 = 2,
+            port: u16,
+            addr: u32,
+            zero: [8]u8 = @splat(0),
+        };
+
+    pub const SockAddrUn = if (is_linux)
+        linux.sockaddr.un
+    else
+        extern struct {
+            len: u8 = @sizeOf(@This()),
+            family: u8 = 1,
+            path: [104]u8 = @splat(0),
+        };
+
+    pub const PollFd = if (is_linux) linux.pollfd else std.c.pollfd;
+
+    extern "c" fn arc4random_buf(buf: [*]u8, nbytes: usize) void;
+
+    pub fn initSockAddrIn(host_ipv4_be: u32, port_native: u16) SockAddrIn {
+        if (is_linux) {
+            return .{
+                .family = linux.AF.INET,
+                .port = std.mem.nativeToBig(u16, port_native),
+                .addr = host_ipv4_be,
+                .zero = @splat(0),
+            };
+        } else {
+            return .{
+                .len = @sizeOf(SockAddrIn),
+                .family = @intCast(AF_INET),
+                .port = std.mem.nativeToBig(u16, port_native),
+                .addr = host_ipv4_be,
+                .zero = @splat(0),
+            };
+        }
+    }
+
+    pub fn initSockAddrUn(socket_path: []const u8) !SockAddrUn {
+        if (socket_path.len == 0 or socket_path.len >= MAX_UNIX_SOCKET_PATH) {
+            return error.SocketPathTooLong;
+        }
+        var addr: SockAddrUn = if (is_linux) .{
+            .family = linux.AF.UNIX,
+            .path = @splat(0),
+        } else .{
+            .len = @sizeOf(SockAddrUn),
+            .family = @intCast(AF_UNIX),
+            .path = @splat(0),
+        };
+        @memcpy(addr.path[0..socket_path.len], socket_path);
+        return addr;
+    }
+
+    pub fn configureDarwinSocket(fd: i32) void {
+        if (!is_linux) {
+            const F_SETFD: c_int = 2;
+            const FD_CLOEXEC: c_int = 1;
+            _ = std.c.fcntl(fd, F_SETFD, FD_CLOEXEC);
+            const one: c_int = 1;
+            _ = std.c.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, @sizeOf(c_int));
+        }
+    }
+
+    pub fn socketTcp() !i32 {
+        if (is_linux) {
+            const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.SocketCreationFailed;
+            return @intCast(rc);
+        } else {
+            const fd = std.c.socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) return error.SocketCreationFailed;
+            configureDarwinSocket(fd);
+            return fd;
+        }
+    }
+
+    pub fn socketUnixSeqPacket() !i32 {
+        if (is_linux) {
+            const rc = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.SocketCreationFailed;
+            return @intCast(rc);
+        } else {
+            const fd = std.c.socket(AF_UNIX, SOCK_SEQPACKET, 0);
+            if (fd < 0) return error.SocketCreationFailed;
+            configureDarwinSocket(fd);
+            return fd;
+        }
+    }
+
+    pub fn socketUnixStream() !i32 {
+        if (is_linux) {
+            const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.SocketCreationFailed;
+            return @intCast(rc);
+        } else {
+            const fd = std.c.socket(AF_UNIX, SOCK_STREAM, 0);
+            if (fd < 0) return error.SocketCreationFailed;
+            configureDarwinSocket(fd);
+            return fd;
+        }
+    }
+
+    pub fn setReuseAddr(fd: i32) void {
+        if (is_linux) {
+            const one: i32 = 1;
+            _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(i32));
+        } else {
+            const one: c_int = 1;
+            _ = std.c.setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, @sizeOf(c_int));
+        }
+    }
+
+    pub fn bindIn(fd: i32, addr: *const SockAddrIn) !void {
+        if (is_linux) {
+            const rc = linux.bind(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+            if (linux.errno(rc) != .SUCCESS) return error.BindFailed;
+        } else {
+            const rc = std.c.bind(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+            if (rc != 0) return error.BindFailed;
+        }
+    }
+
+    pub fn bindUn(fd: i32, addr: *const SockAddrUn) !void {
+        if (is_linux) {
+            const rc = linux.bind(fd, @ptrCast(addr), @sizeOf(SockAddrUn));
+            if (linux.errno(rc) != .SUCCESS) return error.BindFailed;
+        } else {
+            const rc = std.c.bind(fd, @ptrCast(addr), @sizeOf(SockAddrUn));
+            if (rc != 0) return error.BindFailed;
+        }
+    }
+
+    pub fn listen(fd: i32, backlog: u31) !void {
+        if (is_linux) {
+            const rc = linux.listen(fd, backlog);
+            if (linux.errno(rc) != .SUCCESS) return error.ListenFailed;
+        } else {
+            const rc = std.c.listen(fd, backlog);
+            if (rc != 0) return error.ListenFailed;
+        }
+    }
+
+    pub fn getsocknamePort(fd: i32, fallback_port: u16) u16 {
+        var bound_addr: SockAddrIn = undefined;
+        var addr_len: u32 = @sizeOf(SockAddrIn);
+        if (is_linux) {
+            if (linux.errno(linux.getsockname(fd, @ptrCast(&bound_addr), &addr_len)) == .SUCCESS) {
+                return std.mem.bigToNative(u16, bound_addr.port);
+            }
+        } else {
+            if (std.c.getsockname(fd, @ptrCast(&bound_addr), &addr_len) == 0) {
+                return std.mem.bigToNative(u16, bound_addr.port);
+            }
+        }
+        return fallback_port;
+    }
+
+    pub fn accept(listen_fd: i32) !i32 {
+        if (is_linux) {
+            const rc = linux.accept4(listen_fd, null, null, linux.SOCK.CLOEXEC);
+            if (linux.errno(rc) != .SUCCESS) return error.AcceptFailed;
+            return @intCast(rc);
+        } else {
+            const fd = std.c.accept(listen_fd, null, null);
+            if (fd < 0) return error.AcceptFailed;
+            configureDarwinSocket(fd);
+            return fd;
+        }
+    }
+
+    pub fn connectIn(fd: i32, addr: *const SockAddrIn) !void {
+        if (is_linux) {
+            const rc = linux.connect(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+            if (linux.errno(rc) != .SUCCESS) return error.ConnectFailed;
+        } else {
+            const rc = std.c.connect(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+            if (rc != 0) return error.ConnectFailed;
+        }
+    }
+
+    pub fn connectUn(fd: i32, addr: *const SockAddrUn) !void {
+        if (is_linux) {
+            const rc = linux.connect(fd, @ptrCast(addr), @sizeOf(SockAddrUn));
+            if (linux.errno(rc) != .SUCCESS) return error.ConnectFailed;
+        } else {
+            const rc = std.c.connect(fd, @ptrCast(addr), @sizeOf(SockAddrUn));
+            if (rc != 0) return error.ConnectFailed;
+        }
+    }
+
+    pub fn pollIn(fd: i32, timeout_ms: i32) struct { ready: bool, revents: i16 } {
+        var pfd = [1]PollFd{
+            .{
+                .fd = fd,
+                .events = POLLIN,
+                .revents = 0,
+            },
+        };
+        if (is_linux) {
+            const rc = linux.poll(&pfd, 1, timeout_ms);
+            if (linux.errno(rc) != .SUCCESS or rc == 0) return .{ .ready = false, .revents = 0 };
+            return .{ .ready = true, .revents = pfd[0].revents };
+        } else {
+            const rc = std.c.poll(&pfd, 1, timeout_ms);
+            if (rc <= 0) return .{ .ready = false, .revents = 0 };
+            return .{ .ready = true, .revents = pfd[0].revents };
+        }
+    }
+
+    pub fn recv(fd: i32, buf: []u8) !usize {
+        if (is_linux) {
+            while (true) {
+                const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => return @intCast(rc),
+                    .INTR => continue,
+                    else => return error.SocketReadFailed,
+                }
+            }
+        } else {
+            while (true) {
+                const rc = std.c.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+                if (rc >= 0) return @intCast(rc);
+                const err = std.c._errno().*;
+                if (err == @intFromEnum(std.c.E.INTR)) continue;
+                return error.SocketReadFailed;
+            }
+        }
+    }
+
+    pub fn recvSeqPacket(allocator: Allocator, fd: i32, max_packet_bytes: usize) !?[]u8 {
+        if (is_linux) {
+            var peek_byte: [1]u8 = undefined;
+            const peek_rc = linux.recvfrom(
+                fd,
+                &peek_byte,
+                peek_byte.len,
+                linux.MSG.PEEK | linux.MSG.TRUNC,
+                null,
+                null,
+            );
+            switch (linux.errno(peek_rc)) {
+                .SUCCESS => {},
+                .INTR => return try allocator.alloc(u8, 0),
+                else => return null,
+            }
+            if (peek_rc == 0) return null;
+
+            const pkt_len: usize = @min(@as(usize, @intCast(peek_rc)), max_packet_bytes);
+            const buf = try allocator.alloc(u8, pkt_len);
+            errdefer allocator.free(buf);
+
+            const read_rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+            if (linux.errno(read_rc) != .SUCCESS or read_rc == 0) {
+                allocator.free(buf);
+                return null;
+            }
+            const actual_len: usize = @min(@as(usize, @intCast(read_rc)), buf.len);
+            return buf[0..actual_len];
+        } else {
+            const buf = try allocator.alloc(u8, max_packet_bytes);
+            errdefer allocator.free(buf);
+            const n = recv(fd, buf) catch {
+                allocator.free(buf);
+                return null;
+            };
+            if (n == 0) {
+                allocator.free(buf);
+                return null;
+            }
+            const out = try allocator.dupe(u8, buf[0..n]);
+            allocator.free(buf);
+            return out;
+        }
+    }
+
+    pub fn sendAll(fd: i32, data: []const u8) !void {
+        if (is_linux) {
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const rc = linux.sendto(
+                    fd,
+                    data[offset..].ptr,
+                    data.len - offset,
+                    linux.MSG.NOSIGNAL,
+                    null,
+                    0,
+                );
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc == 0) return error.ConnectionClosed;
+                        offset += @intCast(rc);
+                    },
+                    .INTR, .AGAIN => continue,
+                    else => return error.SocketWriteFailed,
+                }
+            }
+        } else {
+            configureDarwinSocket(fd);
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const rc = std.c.sendto(
+                    fd,
+                    data[offset..].ptr,
+                    data.len - offset,
+                    0,
+                    null,
+                    0,
+                );
+                if (rc > 0) {
+                    offset += @intCast(rc);
+                    continue;
+                }
+                if (rc == 0) return error.ConnectionClosed;
+                const err = std.c._errno().*;
+                if (err == @intFromEnum(std.c.E.INTR) or err == @intFromEnum(std.c.E.AGAIN)) continue;
+                return error.SocketWriteFailed;
+            }
+        }
+    }
+
+    pub fn sendPacket(fd: i32, data: []const u8) !void {
+        if (is_linux) {
+            while (true) {
+                const rc = linux.sendto(
+                    fd,
+                    data.ptr,
+                    data.len,
+                    linux.MSG.NOSIGNAL,
+                    null,
+                    0,
+                );
+                switch (linux.errno(rc)) {
+                    .SUCCESS => return,
+                    .INTR, .AGAIN => continue,
+                    else => return error.SocketWriteFailed,
+                }
+            }
+        } else {
+            try sendAll(fd, data);
+        }
+    }
+
+    pub fn shutdownRdwr(fd: i32) void {
+        if (is_linux) {
+            _ = linux.shutdown(fd, linux.SHUT.RDWR);
+        } else {
+            _ = std.c.shutdown(fd, 2);
+        }
+    }
+
+    pub fn close(fd: i32) void {
+        if (is_linux) {
+            _ = linux.close(fd);
+        } else {
+            _ = std.c.close(fd);
+        }
+    }
+
+    pub fn unlink(path_z: [*:0]const u8) void {
+        if (is_linux) {
+            _ = linux.unlink(path_z);
+        } else {
+            _ = std.c.unlink(path_z);
+        }
+    }
+
+    pub fn writeStdout(bytes: []const u8) void {
+        if (is_linux) {
+            _ = linux.write(linux.STDOUT_FILENO, bytes.ptr, bytes.len);
+        } else {
+            _ = std.c.write(1, bytes.ptr, bytes.len);
+        }
+    }
+
+    pub fn readFileAlloc(allocator: Allocator, path_z: [*:0]const u8, max_bytes: usize) ![]u8 {
+        if (is_linux) {
+            const open_rc = linux.openat(
+                linux.AT.FDCWD,
+                path_z,
+                .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+                0,
+            );
+            if (linux.errno(open_rc) != .SUCCESS) return error.FileNotFound;
+            const file_fd: i32 = @intCast(open_rc);
+            defer _ = linux.close(file_fd);
+
+            var content: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer content.deinit(allocator);
+
+            var read_buf: [8192]u8 = undefined;
+            while (content.items.len < max_bytes) {
+                const rrc = linux.read(file_fd, &read_buf, read_buf.len);
+                if (linux.errno(rrc) != .SUCCESS) return error.ReadError;
+                const n: usize = @intCast(rrc);
+                if (n == 0) break;
+                try content.appendSlice(allocator, read_buf[0..n]);
+            }
+            return try content.toOwnedSlice(allocator);
+        } else {
+            const file_fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+            if (file_fd < 0) return error.FileNotFound;
+            defer _ = std.c.close(file_fd);
+
+            var content: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer content.deinit(allocator);
+
+            var read_buf: [8192]u8 = undefined;
+            while (content.items.len < max_bytes) {
+                const rrc = std.c.read(file_fd, &read_buf, read_buf.len);
+                if (rrc < 0) return error.ReadError;
+                const n: usize = @intCast(rrc);
+                if (n == 0) break;
+                try content.appendSlice(allocator, read_buf[0..n]);
+            }
+            return try content.toOwnedSlice(allocator);
+        }
+    }
+
+    pub fn fillRandom(buf: []u8) void {
+        if (is_linux) {
+            _ = linux.getrandom(buf.ptr, buf.len, 0);
+        } else {
+            arc4random_buf(buf.ptr, buf.len);
+        }
+    }
+};

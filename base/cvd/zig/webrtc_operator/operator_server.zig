@@ -1,7 +1,7 @@
 const std = @import("std");
-const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
+const os_socket = protocol.os_socket;
 const registry_mod = @import("registry.zig");
 const Registry = registry_mod.Registry;
 const DeviceSink = registry_mod.DeviceSink;
@@ -86,15 +86,9 @@ pub const BufferedConnReader = struct {
             }
             self.pos = 0;
             self.end = 0;
-            const rc = linux.recvfrom(self.fd, &self.buf, self.buf.len, 0, null, null);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return error.EndOfStream;
-                    self.end = rc;
-                },
-                .INTR => continue,
-                else => return error.SocketReadFailed,
-            }
+            const n = try os_socket.recv(self.fd, &self.buf);
+            if (n == 0) return error.EndOfStream;
+            self.end = n;
         }
     }
 };
@@ -187,46 +181,16 @@ pub const OperatorServer = struct {
     }
 
     pub fn bindAndListen(self: *OperatorServer) !void {
-        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        if (linux.errno(rc) != .SUCCESS) {
-            return error.SocketCreationFailed;
-        }
-        const fd: i32 = @intCast(rc);
-        errdefer _ = linux.close(fd);
+        const fd = try os_socket.socketTcp();
+        errdefer os_socket.close(fd);
 
-        const one: i32 = 1;
-        _ = linux.setsockopt(
-            fd,
-            linux.SOL.SOCKET,
-            linux.SO.REUSEADDR,
-            std.mem.asBytes(&one),
-            @sizeOf(i32),
-        );
+        os_socket.setReuseAddr(fd);
 
-        var addr: linux.sockaddr.in = .{
-            .family = linux.AF.INET,
-            .port = std.mem.nativeToBig(u16, self.config.port),
-            .addr = self.config.host_ipv4_be,
-        };
+        const addr = os_socket.initSockAddrIn(self.config.host_ipv4_be, self.config.port);
+        try os_socket.bindIn(fd, &addr);
+        try os_socket.listen(fd, 64);
 
-        const bind_rc = linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-        if (linux.errno(bind_rc) != .SUCCESS) {
-            return error.BindFailed;
-        }
-
-        const listen_rc = linux.listen(fd, 64);
-        if (linux.errno(listen_rc) != .SUCCESS) {
-            return error.ListenFailed;
-        }
-
-        var bound_addr: linux.sockaddr.in = undefined;
-        var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-        if (linux.errno(linux.getsockname(fd, @ptrCast(&bound_addr), &addr_len)) == .SUCCESS) {
-            self.bound_port = std.mem.bigToNative(u16, bound_addr.port);
-        } else {
-            self.bound_port = self.config.port;
-        }
-
+        self.bound_port = os_socket.getsocknamePort(fd, self.config.port);
         self.listen_fd = fd;
     }
 
@@ -241,14 +205,14 @@ pub const OperatorServer = struct {
     pub fn stop(self: *OperatorServer) void {
         self.running.store(false, .release);
         if (self.listen_fd >= 0) {
-            _ = linux.shutdown(self.listen_fd, linux.SHUT.RDWR);
+            os_socket.shutdownRdwr(self.listen_fd);
         }
         if (self.accept_thread) |thread| {
             thread.join();
             self.accept_thread = null;
         }
         if (self.listen_fd >= 0) {
-            _ = linux.close(self.listen_fd);
+            os_socket.close(self.listen_fd);
             self.listen_fd = -1;
         }
     }
@@ -259,32 +223,23 @@ pub const OperatorServer = struct {
 
     fn acceptLoop(self: *OperatorServer) void {
         while (self.running.load(.acquire)) {
-            var pfd = [1]linux.pollfd{
-                .{
-                    .fd = self.listen_fd,
-                    .events = linux.POLL.IN,
-                    .revents = 0,
-                },
-            };
-            const poll_rc = linux.poll(&pfd, 1, 50);
+            const poll_res = os_socket.pollIn(self.listen_fd, 50);
             if (!self.running.load(.acquire)) break;
-            if (linux.errno(poll_rc) != .SUCCESS or poll_rc == 0) continue;
-            if ((pfd[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL)) != 0 and
-                (pfd[0].revents & linux.POLL.IN) == 0)
+            if (!poll_res.ready) continue;
+            if ((poll_res.revents & (os_socket.POLLERR | os_socket.POLLHUP | os_socket.POLLNVAL)) != 0 and
+                (poll_res.revents & os_socket.POLLIN) == 0)
             {
                 if (!self.running.load(.acquire)) break;
                 continue;
             }
 
-            const client_rc = linux.accept4(self.listen_fd, null, null, linux.SOCK.CLOEXEC);
-            if (linux.errno(client_rc) != .SUCCESS) {
+            const client_fd = os_socket.accept(self.listen_fd) catch {
                 if (!self.running.load(.acquire)) break;
                 continue;
-            }
-            const client_fd: i32 = @intCast(client_rc);
+            };
 
             const conn_thread = std.Thread.spawn(.{}, handleConnectionThread, .{ self, client_fd }) catch {
-                _ = linux.close(client_fd);
+                os_socket.close(client_fd);
                 continue;
             };
             conn_thread.detach();
@@ -292,7 +247,7 @@ pub const OperatorServer = struct {
     }
 
     fn handleConnectionThread(self: *OperatorServer, client_fd: i32) void {
-        defer _ = linux.close(client_fd);
+        defer os_socket.close(client_fd);
         self.handleConnection(client_fd) catch {};
     }
 
@@ -304,15 +259,9 @@ pub const OperatorServer = struct {
         var header_end_idx: ?usize = null;
         while (header_end_idx == null) {
             if (req_buf.items.len > 64 * 1024) return error.HeadersTooLarge;
-            const rc = linux.recvfrom(client_fd, &temp, temp.len, 0, null, null);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) return;
-                    try req_buf.appendSlice(self.allocator, temp[0..rc]);
-                },
-                .INTR => continue,
-                else => return error.SocketReadFailed,
-            }
+            const n = try os_socket.recv(client_fd, &temp);
+            if (n == 0) return;
+            try req_buf.appendSlice(self.allocator, temp[0..n]);
             if (std.mem.indexOf(u8, req_buf.items, "\r\n\r\n")) |idx| {
                 header_end_idx = idx;
             }
@@ -368,15 +317,9 @@ pub const OperatorServer = struct {
 
         if (content_length > 4 * 1024 * 1024) return error.PayloadTooLarge;
         while (req_buf.items.len - body_start < content_length) {
-            const rc = linux.recvfrom(client_fd, &temp, temp.len, 0, null, null);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {
-                    if (rc == 0) break;
-                    try req_buf.appendSlice(self.allocator, temp[0..rc]);
-                },
-                .INTR => continue,
-                else => return error.SocketReadFailed,
-            }
+            const n = try os_socket.recv(client_fd, &temp);
+            if (n == 0) break;
+            try req_buf.appendSlice(self.allocator, temp[0..n]);
         }
 
         const avail_body = req_buf.items[body_start..];
@@ -785,7 +728,7 @@ pub const OperatorServer = struct {
             return;
         }
 
-        var full_path_buf: [linux.PATH_MAX]u8 = undefined;
+        var full_path_buf: [os_socket.PATH_MAX]u8 = undefined;
         const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ self.config.assets_dir, rel_path }) catch {
             try sendHttpResponse(client_fd, "404 Not Found", "text/plain; charset=utf-8", "Not Found", false);
             return;
@@ -796,40 +739,14 @@ pub const OperatorServer = struct {
         }
         full_path_buf[full_path.len] = 0;
 
-        const open_rc = linux.openat(
-            linux.AT.FDCWD,
-            @ptrCast(&full_path_buf),
-            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
-            0,
-        );
-        if (linux.errno(open_rc) != .SUCCESS) {
+        const file_bytes = os_socket.readFileAlloc(self.allocator, @ptrCast(&full_path_buf), 16 * 1024 * 1024) catch {
             try sendHttpResponse(client_fd, "404 Not Found", "text/plain; charset=utf-8", "Not Found", false);
             return;
-        }
-        const file_fd: i32 = @intCast(open_rc);
-        defer _ = linux.close(file_fd);
-
-        var file_bytes: std.ArrayList(u8) = .empty;
-        defer file_bytes.deinit(self.allocator);
-
-        var chunk: [8192]u8 = undefined;
-        while (true) {
-            const read_rc = linux.read(file_fd, &chunk, chunk.len);
-            switch (linux.errno(read_rc)) {
-                .SUCCESS => {
-                    if (read_rc == 0) break;
-                    try file_bytes.appendSlice(self.allocator, chunk[0..read_rc]);
-                },
-                .INTR => continue,
-                else => {
-                    try sendHttpResponse(client_fd, "404 Not Found", "text/plain; charset=utf-8", "Not Found", false);
-                    return;
-                },
-            }
-        }
+        };
+        defer self.allocator.free(file_bytes);
 
         const content_type = mimeTypeForPath(rel_path);
-        try sendHttpResponse(client_fd, "200 OK", content_type, file_bytes.items, false);
+        try sendHttpResponse(client_fd, "200 OK", content_type, file_bytes, false);
     }
 };
 
@@ -858,6 +775,7 @@ fn sendHttpResponse(
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
+                "Cache-Control: no-store, no-cache, must-revalidate\r\n" ++
                 "Access-Control-Allow-Origin: *\r\n" ++
                 "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
                 "Access-Control-Allow-Headers: Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With, Accept\r\n" ++
@@ -871,6 +789,7 @@ fn sendHttpResponse(
             "HTTP/1.1 {s}\r\n" ++
                 "Content-Type: {s}\r\n" ++
                 "Content-Length: {d}\r\n" ++
+                "Cache-Control: no-store, no-cache, must-revalidate\r\n" ++
                 "Connection: close\r\n" ++
                 "\r\n",
             .{ status, content_type, body.len },

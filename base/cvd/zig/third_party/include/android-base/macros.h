@@ -1,6 +1,11 @@
 #pragma once
 
+#include <sys/types.h>
 #include <cstddef>
+
+#if defined(__APPLE__) || !defined(__GLIBC__)
+using off64_t = off_t;
+#endif
 
 #ifndef DISALLOW_COPY_AND_ASSIGN
 #define DISALLOW_COPY_AND_ASSIGN(TypeName) \

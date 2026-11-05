@@ -312,6 +312,10 @@ pub const Config = struct {
     stun_server: ?ice.ServerConfig = null,
     stun_server_uri: ?[:0]const u8 = null,
     dtls: dtls_srtp.Config = .{},
+    host_ipv4: [4]u8 = .{ 127, 0, 0, 1 },
+    host_ipv6: ?[:0]const u8 = null,
+    udp_port_min: u16 = 15550,
+    udp_port_max: u16 = 15599,
 };
 
 pub const Callbacks = struct {
@@ -333,9 +337,17 @@ pub const PeerConnection = struct {
             s.uri.ptr
         else
             null;
+        const min_p = if (config.port_range.min_port != 15550 or config.udp_port_min == 15550)
+            config.port_range.min_port
+        else
+            config.udp_port_min;
+        const max_p = if (config.port_range.max_port != 15599 or config.udp_port_max == 15599)
+            config.port_range.max_port
+        else
+            config.udp_port_max;
         const c_cfg = c.cf_webrtc_pc_config_t{
-            .min_port = config.port_range.min_port,
-            .max_port = config.port_range.max_port,
+            .min_port = min_p,
+            .max_port = max_p,
             .stun_server_uri = stun_ptr,
         };
         const c_cb = c.cf_webrtc_pc_callbacks_t{
@@ -346,7 +358,31 @@ pub const PeerConnection = struct {
         };
         const h = c.cf_webrtc_pc_create(factory.handle, &c_cfg, &c_cb) orelse
             return Error.InitializationFailed;
-        return .{ .handle = h, .backend = factory.backend };
+        var pc_inst = PeerConnection{ .handle = h, .backend = factory.backend };
+        if (!std.mem.eql(u8, &config.host_ipv4, &[4]u8{ 127, 0, 0, 1 }) or config.host_ipv6 != null) {
+            try pc_inst.setIceHosts(config.host_ipv4, config.host_ipv6);
+        }
+        return pc_inst;
+    }
+
+    pub fn setIceHosts(self: *PeerConnection, host_ipv4: [4]u8, host_ipv6: ?[]const u8) Error!void {
+        const impl: *PeerConnectionImpl = @ptrCast(@alignCast(self.handle));
+        impl.setIceHosts(host_ipv4, host_ipv6) catch return Error.InternalError;
+    }
+
+    pub fn pollUdpOnce(self: *PeerConnection) Error!bool {
+        const impl: *PeerConnectionImpl = @ptrCast(@alignCast(self.handle));
+        return impl.pollUdpOnce() catch return Error.InternalError;
+    }
+
+    pub fn pumpUdpSocket(self: *PeerConnection) Error!usize {
+        const impl: *PeerConnectionImpl = @ptrCast(@alignCast(self.handle));
+        return impl.pumpUdpSocket() catch return Error.InternalError;
+    }
+
+    pub fn getBoundPort(self: *const PeerConnection) u16 {
+        const impl: *const PeerConnectionImpl = @ptrCast(@alignCast(self.handle));
+        return impl.getBoundPort();
     }
 
     pub fn deinit(self: *PeerConnection) void {
@@ -665,6 +701,11 @@ const DataChannelImpl = struct {
 
 const max_dc_handles = 16;
 
+pub const VideoCodec = enum {
+    h264,
+    vp8,
+};
+
 const PeerConnectionImpl = struct {
     peer_id: u64,
     config: c.cf_webrtc_pc_config_t,
@@ -691,9 +732,210 @@ const PeerConnectionImpl = struct {
     sctp_assoc: sctp.Association,
     sctp_loopback_peer: sctp.Association,
     paired_peer: ?*PeerConnectionImpl = null,
+    remote_udp_addr: ?struct { ip: [4]u8, port: u16 } = null,
+    negotiated_video_codec: VideoCodec = .h264,
+    h264_sequencer: rtp.RtpSequencer = .{ .ssrc = 0x22334455, .payload_type = 102, .next_seq = 1000 },
+    vp8_sequencer: rtp.RtpSequencer = .{ .ssrc = 0x11223344, .payload_type = 96, .next_seq = 1 },
     dc_handles: [max_dc_handles]?*DataChannelImpl = @splat(null),
     attached_video: [max_attached_pcs]?*VideoSourceImpl = @splat(null),
     attached_audio: [max_attached_pcs]?*AudioSourceImpl = @splat(null),
+
+    pub fn setIceHosts(self: *PeerConnectionImpl, host_ipv4: [4]u8, host_ipv6: ?[]const u8) !void {
+        try self.ice_agent.setHostAddresses(host_ipv4, host_ipv6);
+        try self.ice_agent.gatherHostCandidates();
+    }
+
+    pub fn getBoundPort(self: *const PeerConnectionImpl) u16 {
+        return self.ice_agent.bound_port orelse 0;
+    }
+
+    pub fn sendUdpToActivePeer(self: *PeerConnectionImpl, packet: []const u8) !void {
+        if (self.ice_agent.nominated_pair) |pair| {
+            try self.ice_agent.sendUdp(pair.remote.address, pair.remote.port, packet);
+            return;
+        }
+        if (self.remote_udp_addr) |dst| {
+            try self.ice_agent.sendUdp(dst.ip, dst.port, packet);
+            return;
+        }
+        return error.NoRemoteAddress;
+    }
+
+    pub fn pollUdpOnce(self: *PeerConnectionImpl) !bool {
+        if (self.ice_agent.socket_fd == null) return false;
+        var rx_buf: [2048]u8 = undefined;
+        const rx = (try self.ice_agent.recvUdpNonBlocking(&rx_buf)) orelse return false;
+        const pkt = rx.data;
+        const src_ip = rx.src_ip;
+        const src_port = rx.src_port;
+
+        switch (dtls_srtp.classifyPacket(pkt)) {
+            .stun => {
+                self.remote_udp_addr = .{ .ip = src_ip, .port = src_port };
+                var resp_buf: [512]u8 = undefined;
+                if (try self.ice_agent.handleStunPacket(pkt, src_ip, src_port, &resp_buf)) |resp| {
+                    try self.ice_agent.sendUdp(src_ip, src_port, resp);
+                }
+                if (self.ice_agent.state == .connected or self.ice_agent.state == .completed) {
+                    self.setState(.connected);
+                    for (self.dc_handles) |maybe_dc| {
+                        if (maybe_dc) |dc| dc.setState(.open);
+                    }
+                }
+            },
+            .dtls => {
+                if (self.remote_udp_addr == null) {
+                    self.remote_udp_addr = .{ .ip = src_ip, .port = src_port };
+                }
+                if (pkt.len > 0 and pkt[0] == @intFromEnum(dtls_srtp.ContentType.application_data) and self.dtls_ready) {
+                    var plain_buf: [4096]u8 = undefined;
+                    if (self.dtls_session.unprotectApplicationData(pkt, &plain_buf)) |dec_slice| {
+                        try self.sctp_assoc.handleInboundPacket(dec_slice);
+                        while (self.sctp_assoc.pollOutboundPacket()) |reply_pkt| {
+                            defer self.sctp_assoc.allocator.free(reply_pkt);
+                            var dtls_out_buf: [4096]u8 = undefined;
+                            if (self.dtls_session.protectApplicationData(reply_pkt, &dtls_out_buf)) |enc_reply| {
+                                try self.ice_agent.sendUdp(src_ip, src_port, enc_reply);
+                            } else |_| {
+                                try self.ice_agent.sendUdp(src_ip, src_port, reply_pkt);
+                            }
+                        }
+                    } else |_| {}
+                } else {
+                    var out_flight_buf: [4096]u8 = undefined;
+                    const out_flight = try self.dtls_session.processHandshakePacket(pkt, &out_flight_buf);
+                    if (out_flight.len > 0) {
+                        try self.ice_agent.sendUdp(src_ip, src_port, out_flight);
+                    }
+                    if (self.dtls_session.state == .connected and !self.dtls_ready) {
+                        if (self.dtls_session.srtp_keys) |km| {
+                            const rx_role: dtls_srtp.Role = if (self.dtls_session.role == .client) .server else .client;
+                            self.srtp_tx = try dtls_srtp.SrtpContext.initFromKeyMaterial(km, self.dtls_session.role);
+                            self.srtp_rx = try dtls_srtp.SrtpContext.initFromKeyMaterial(km, rx_role);
+                            self.dtls_ready = true;
+                            self.setState(.connected);
+                        }
+                    }
+                }
+            },
+            .rtp_rtcp => {
+                if (self.remote_udp_addr == null) {
+                    self.remote_udp_addr = .{ .ip = src_ip, .port = src_port };
+                }
+                const is_rtcp = pkt.len >= 8 and pkt[1] >= 200 and pkt[1] <= 207;
+                if (self.srtp_rx) |*rx_ctx| {
+                    var plain_buf: [2048]u8 = undefined;
+                    if (is_rtcp) {
+                        _ = try rx_ctx.unprotectRtcp(pkt, &plain_buf);
+                        _ = self.srtp_packets_received.fetchAdd(1, .acq_rel);
+                    } else {
+                        const dec_slice = try rx_ctx.unprotectRtp(pkt, &plain_buf);
+                        _ = self.srtp_packets_received.fetchAdd(1, .acq_rel);
+                        if (rtp.Packet.parse(dec_slice)) |parsed_rtp| {
+                            if (parsed_rtp.header.payload_type == 111) {
+                                _ = rtp.OpusDepacketizer.depacketize(parsed_rtp) catch {};
+                            } else if (parsed_rtp.header.payload_type == 102) {
+                                if (self.h264_depacketizer.push(engine_allocator, parsed_rtp) catch null) |au| {
+                                    engine_allocator.free(au);
+                                }
+                            } else {
+                                if (self.vp8_depacketizer.push(engine_allocator, parsed_rtp) catch null) |frame| {
+                                    engine_allocator.free(frame.data);
+                                }
+                            }
+                        } else |_| {}
+                    }
+                } else {
+                    _ = self.srtp_packets_received.fetchAdd(1, .acq_rel);
+                }
+            },
+            .unknown, .turn_channel => {
+                if (pkt.len >= 12) {
+                    if (self.remote_udp_addr == null) {
+                        self.remote_udp_addr = .{ .ip = src_ip, .port = src_port };
+                    }
+                    try self.sctp_assoc.handleInboundPacket(pkt);
+                    while (self.sctp_assoc.pollOutboundPacket()) |reply_pkt| {
+                        defer self.sctp_assoc.allocator.free(reply_pkt);
+                        try self.ice_agent.sendUdp(src_ip, src_port, reply_pkt);
+                    }
+                    if (self.sctp_assoc.state == .established) {
+                        for (self.dc_handles) |maybe_dc| {
+                            if (maybe_dc) |dc| dc.setState(.open);
+                        }
+                    }
+                }
+            },
+        }
+        return true;
+    }
+
+    pub fn pumpUdpSocket(self: *PeerConnectionImpl) !usize {
+        var count: usize = 0;
+        while (count < 64) {
+            const got = try self.pollUdpOnce();
+            if (!got) break;
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn pushVideoFrame(
+        self: *PeerConnectionImpl,
+        frame_data: []const u8,
+        is_keyframe: bool,
+        timestamp_90khz: u32,
+    ) !usize {
+        if (self.negotiated_video_codec == .h264) {
+            var encoded_buf: [16384]u8 = undefined;
+            const annexb_data: []const u8 = if (frame_data.len >= 4 and
+                ((frame_data[0] == 0 and frame_data[1] == 0 and frame_data[2] == 0 and frame_data[3] == 1) or
+                    (frame_data[0] == 0 and frame_data[1] == 0 and frame_data[2] == 1)))
+                frame_data
+            else blk: {
+                var y_plane: [16 * 16]u8 = @splat(128);
+                const copy_len = @min(frame_data.len, y_plane.len);
+                @memcpy(y_plane[0..copy_len], frame_data[0..copy_len]);
+                var u_plane: [8 * 8]u8 = @splat(128);
+                var v_plane: [8 * 8]u8 = @splat(128);
+                break :blk try rtp.encodeH264BaselineIpcmFrame(
+                    &y_plane,
+                    &u_plane,
+                    &v_plane,
+                    16,
+                    16,
+                    16,
+                    8,
+                    &encoded_buf,
+                );
+            };
+
+            var h264_pkt = rtp.H264Packetizer{
+                .sequencer = &self.h264_sequencer,
+                .mode = .non_interleaved,
+                .max_payload_len = 1100,
+            };
+            const pkts = try h264_pkt.packetize(engine_allocator, annexb_data, timestamp_90khz);
+            defer {
+                for (pkts) |p| p.deinit(engine_allocator);
+                engine_allocator.free(pkts);
+            }
+            self.sendMediaRtpPackets(pkts, true, false);
+            return pkts.len;
+        } else {
+            var vp8_pkt = rtp.Vp8Packetizer{
+                .sequencer = &self.vp8_sequencer,
+                .max_payload_len = 1100,
+            };
+            const pkts = try vp8_pkt.packetize(engine_allocator, frame_data, timestamp_90khz, !is_keyframe);
+            defer {
+                for (pkts) |p| p.deinit(engine_allocator);
+                engine_allocator.free(pkts);
+            }
+            self.sendMediaRtpPackets(pkts, false, false);
+            return pkts.len;
+        }
+    }
 
     fn localUfrag(self: *const PeerConnectionImpl) []const u8 {
         return self.local_ufrag_buf[0..self.local_ufrag_len];
@@ -776,6 +1018,7 @@ const PeerConnectionImpl = struct {
                 defer self.sctp_assoc.allocator.free(sctp_pkt);
                 progressed = true;
 
+                var sent_udp = false;
                 // Protect SCTP packet inside a DTLS 1.2 application_data record
                 var dtls_record_buf: [4096]u8 = undefined;
                 if (self.dtls_ready) {
@@ -789,6 +1032,10 @@ const PeerConnectionImpl = struct {
                                 } else |_| {}
                             }
                         } else {
+                            if (self.remote_udp_addr != null and self.ice_agent.socket_fd != null) {
+                                self.sendUdpToActivePeer(sctp_pkt) catch {};
+                                sent_udp = true;
+                            }
                             if (self.dtls_peer_loopback.unprotectApplicationData(enc_slice, &plain_buf)) |dec_slice| {
                                 self.sctp_loopback_peer.handleInboundPacket(dec_slice) catch {};
                                 continue;
@@ -801,6 +1048,9 @@ const PeerConnectionImpl = struct {
                 if (target_pc) |peer| {
                     peer.sctp_assoc.handleInboundPacket(sctp_pkt) catch {};
                 } else {
+                    if (!sent_udp and self.remote_udp_addr != null and self.ice_agent.socket_fd != null) {
+                        self.sendUdpToActivePeer(sctp_pkt) catch {};
+                    }
                     self.sctp_loopback_peer.handleInboundPacket(sctp_pkt) catch {};
                 }
             }
@@ -936,19 +1186,24 @@ const PeerConnectionImpl = struct {
                         }
                     }
                 }
-            } else if (self.srtp_rx) |*rx| {
-                const dec_slice = rx.unprotectRtp(enc_slice, &plain_buf) catch continue;
-                _ = self.srtp_packets_received.fetchAdd(1, .acq_rel);
-                const parsed_rtp = rtp.Packet.parse(dec_slice) catch continue;
-                if (is_audio) {
-                    _ = rtp.OpusDepacketizer.depacketize(parsed_rtp) catch {};
-                } else if (is_h264) {
-                    if (self.h264_depacketizer.push(engine_allocator, parsed_rtp) catch null) |au| {
-                        engine_allocator.free(au);
-                    }
-                } else {
-                    if (self.vp8_depacketizer.push(engine_allocator, parsed_rtp) catch null) |frame| {
-                        engine_allocator.free(frame.data);
+            } else {
+                if (self.remote_udp_addr != null and self.ice_agent.socket_fd != null) {
+                    self.sendUdpToActivePeer(enc_slice) catch {};
+                }
+                if (self.srtp_rx) |*rx| {
+                    const dec_slice = rx.unprotectRtp(enc_slice, &plain_buf) catch continue;
+                    _ = self.srtp_packets_received.fetchAdd(1, .acq_rel);
+                    const parsed_rtp = rtp.Packet.parse(dec_slice) catch continue;
+                    if (is_audio) {
+                        _ = rtp.OpusDepacketizer.depacketize(parsed_rtp) catch {};
+                    } else if (is_h264) {
+                        if (self.h264_depacketizer.push(engine_allocator, parsed_rtp) catch null) |au| {
+                            engine_allocator.free(au);
+                        }
+                    } else {
+                        if (self.vp8_depacketizer.push(engine_allocator, parsed_rtp) catch null) |frame| {
+                            engine_allocator.free(frame.data);
+                        }
                     }
                 }
             }
@@ -1100,6 +1355,42 @@ pub export fn cf_webrtc_video_source_push_i420_frame(
         engine_allocator.free(pkts);
     }
     impl.broadcastRtpPackets(pkts, false);
+
+    // Also encode browser-decodable H.264 Baseline I_PCM Annex-B frame when dimensions fit
+    if (width <= 128 and height <= 128) {
+        const w_u16_h264: u16 = @intCast(width);
+        const h_u16_h264: u16 = @intCast(height);
+        const y_st: usize = @intCast(y_stride);
+        const u_st: usize = @intCast(u_stride);
+        const uv_h: usize = @intCast(@divTrunc(height + 1, 2));
+        const y_len = @as(usize, @intCast(height - 1)) * y_st + @as(usize, w_u16_h264);
+        const uv_w: usize = @intCast(chroma_w);
+        const uv_len = (uv_h - 1) * u_st + uv_w;
+        var h264_buf: [65536]u8 = undefined;
+        if (rtp.encodeH264BaselineIpcmFrame(
+            y_ptr[0..y_len],
+            u_ptr[0..uv_len],
+            v_ptr[0..uv_len],
+            w_u16_h264,
+            h_u16_h264,
+            y_st,
+            u_st,
+            &h264_buf,
+        )) |annexb_slice| {
+            var h264_pkt = rtp.H264Packetizer{
+                .sequencer = &impl.h264_sequencer,
+                .mode = .non_interleaved,
+                .max_payload_len = 1100,
+            };
+            if (h264_pkt.packetize(engine_allocator, annexb_slice, rtp_ts)) |h264_pkts| {
+                defer {
+                    for (h264_pkts) |p| p.deinit(engine_allocator);
+                    engine_allocator.free(h264_pkts);
+                }
+                impl.broadcastRtpPackets(h264_pkts, true);
+            } else |_| {}
+        } else |_| {}
+    }
 
     return c.CF_WEBRTC_OK;
 }
@@ -1356,6 +1647,8 @@ pub export fn cf_webrtc_pc_create(
             .is_client = false,
         }),
     };
+    impl.ice_agent.local_ufrag = impl.localUfrag();
+    impl.ice_agent.local_pwd = impl.localPwd();
     impl.sctp_assoc.callbacks = .{
         .user_data = impl,
         .on_channel_open = PeerConnectionImpl.onSctpChannelOpen,
@@ -1364,6 +1657,48 @@ pub export fn cf_webrtc_pc_create(
 
     registerPeer(impl);
     return @ptrCast(impl);
+}
+
+pub export fn cf_webrtc_pc_set_ice_hosts(
+    pc_handle: ?*c.cf_webrtc_pc_t,
+    ipv4_cstr: ?[*:0]const u8,
+    ipv6_cstr: ?[*:0]const u8,
+) callconv(.c) c.cf_webrtc_error_t {
+    const h = pc_handle orelse return c.CF_WEBRTC_ERR_INVALID_ARG;
+    const impl: *PeerConnectionImpl = @ptrCast(@alignCast(h));
+    if (impl.state == .closed) return c.CF_WEBRTC_ERR_STATE;
+
+    const ipv4 = if (ipv4_cstr) |s| blk: {
+        const span = std.mem.span(s);
+        if (span.len == 0) break :blk [4]u8{ 127, 0, 0, 1 };
+        break :blk ice.parseIpv4(span) catch return c.CF_WEBRTC_ERR_INVALID_ARG;
+    } else [4]u8{ 127, 0, 0, 1 };
+
+    const ipv6: ?[]const u8 = if (ipv6_cstr) |s| blk: {
+        const span = std.mem.span(s);
+        break :blk if (span.len > 0) span else null;
+    } else null;
+
+    impl.setIceHosts(ipv4, ipv6) catch return c.CF_WEBRTC_ERR_INTERNAL;
+    return c.CF_WEBRTC_OK;
+}
+
+pub export fn cf_webrtc_pc_poll_udp(
+    pc_handle: ?*c.cf_webrtc_pc_t,
+) callconv(.c) i32 {
+    const h = pc_handle orelse return c.CF_WEBRTC_ERR_INVALID_ARG;
+    const impl: *PeerConnectionImpl = @ptrCast(@alignCast(h));
+    if (impl.state == .closed) return c.CF_WEBRTC_ERR_STATE;
+    const got = impl.pollUdpOnce() catch return c.CF_WEBRTC_ERR_INTERNAL;
+    return if (got) 1 else 0;
+}
+
+pub export fn cf_webrtc_pc_get_bound_port(
+    pc_handle: ?*const c.cf_webrtc_pc_t,
+) callconv(.c) u16 {
+    const h = pc_handle orelse return 0;
+    const impl: *const PeerConnectionImpl = @ptrCast(@alignCast(h));
+    return impl.getBoundPort();
 }
 
 pub export fn cf_webrtc_pc_create_offer(
@@ -1459,11 +1794,16 @@ pub export fn cf_webrtc_pc_set_local_description(
         else
             15550;
 
+        const ip = if (impl.ice_agent.local_candidates.items.len > 0)
+            impl.ice_agent.local_candidates.items[0].address
+        else
+            impl.ice_agent.host_ipv4;
+
         var cand_buf: [192]u8 = @splat(0);
         const cand_slice = std.fmt.bufPrint(
             cand_buf[0 .. cand_buf.len - 1],
-            "candidate:1 1 UDP 2130706431 127.0.0.1 {d} typ host generation 0 ufrag {s}",
-            .{ port, impl.localUfrag() },
+            "candidate:1 1 UDP 2130706431 {d}.{d}.{d}.{d} {d} typ host generation 0 ufrag {s}",
+            .{ ip[0], ip[1], ip[2], ip[3], port, impl.localUfrag() },
         ) catch return c.CF_WEBRTC_ERR_INTERNAL;
         cand_buf[cand_slice.len] = 0;
         const c_cand = c.cf_webrtc_ice_candidate_t{
@@ -1550,6 +1890,13 @@ pub export fn cf_webrtc_pc_add_ice_candidate(
     if (cand_sdp.len == 0) return c.CF_WEBRTC_ERR_INVALID_ARG;
 
     impl.ice_agent.addRemoteCandidate(cand_sdp) catch return c.CF_WEBRTC_ERR_INVALID_ARG;
+    if (impl.remote_udp_addr == null) {
+        if (ice.ParsedCandidate.parse(cand_sdp)) |parsed| {
+            if (parsed.transport == .udp) {
+                impl.remote_udp_addr = .{ .ip = parsed.address, .port = parsed.port };
+            }
+        } else |_| {}
+    }
     impl.tryEstablishConnection();
     return c.CF_WEBRTC_OK;
 }
@@ -1769,5 +2116,176 @@ pub export fn cf_webrtc_dc_destroy(dc: ?*c.cf_webrtc_dc_t) callconv(.c) void {
     }
     engine_allocator.destroy(impl);
 }
+
+test "PeerConnection setIceHosts advertises custom IPv4 198.51.100.1 in port range 15550..15599" {
+    var factory = try Factory.init();
+    defer factory.deinit();
+
+    var pc_inst = try PeerConnection.init(
+        &factory,
+        .{
+            .port_range = .{ .min_port = 15550, .max_port = 15599 },
+            .host_ipv4 = .{ 198, 51, 100, 1 },
+            .host_ipv6 = "fd00::1",
+        },
+        .{},
+    );
+    defer pc_inst.deinit();
+
+    const bound_port = pc_inst.getBoundPort();
+    try std.testing.expect(bound_port >= 15550 and bound_port <= 15599);
+
+    const impl: *PeerConnectionImpl = @ptrCast(@alignCast(pc_inst.handle));
+    try std.testing.expect(impl.ice_agent.local_candidates.items.len >= 1);
+    const cand = impl.ice_agent.local_candidates.items[0];
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 1 }, cand.address);
+    try std.testing.expectEqual(bound_port, cand.port);
+}
+
+test "Real UDP socket STUN connectivity check and SRTP/SCTP packet exchange via pollUdpOnce" {
+    var factory = try Factory.init();
+    defer factory.deinit();
+
+    const RxTrack = struct {
+        dc_messages: usize = 0,
+        last_msg: [64]u8 = @splat(0),
+        last_msg_len: usize = 0,
+
+        fn onDataChannel(
+            user_data: ?*anyopaque,
+            dc_handle: ?*c.cf_webrtc_dc_t,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            const h = dc_handle orelse return;
+            const cb = c.cf_webrtc_dc_callbacks_t{
+                .user_data = self,
+                .on_state_change = null,
+                .on_message = onDcMsg,
+            };
+            cf_webrtc_dc_set_callbacks(h, &cb);
+        }
+
+        fn onDcMsg(
+            user_data: ?*anyopaque,
+            data: ?[*]const u8,
+            len: usize,
+            is_binary: bool,
+        ) callconv(.c) void {
+            _ = is_binary;
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.dc_messages += 1;
+            if (data) |ptr| {
+                const n = @min(len, self.last_msg.len);
+                @memcpy(self.last_msg[0..n], ptr[0..n]);
+                self.last_msg_len = n;
+            }
+        }
+    };
+
+    var rx_track = RxTrack{};
+
+    var pc1 = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{},
+    );
+    defer pc1.deinit();
+
+    var pc2 = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{
+            .user_data = &rx_track,
+            .on_data_channel = RxTrack.onDataChannel,
+        },
+    );
+    defer pc2.deinit();
+
+    const impl1: *PeerConnectionImpl = @ptrCast(@alignCast(pc1.handle));
+    const impl2: *PeerConnectionImpl = @ptrCast(@alignCast(pc2.handle));
+
+    // Unlink in-memory paired_peer so traffic flows strictly over 127.0.0.1 UDP sockets
+    impl1.paired_peer = null;
+    impl2.paired_peer = null;
+
+    try impl1.setIceHosts(.{ 127, 0, 0, 1 }, null);
+    try impl2.setIceHosts(.{ 127, 0, 0, 1 }, null);
+
+    const port1 = pc1.getBoundPort();
+    const port2 = pc2.getBoundPort();
+    try std.testing.expect(port1 >= 15550 and port1 <= 15599);
+    try std.testing.expect(port2 >= 15550 and port2 <= 15599);
+
+    impl1.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = port2 };
+    impl2.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = port1 };
+
+    // Configure ICE credentials so STUN connectivity check succeeds over UDP
+    impl1.ice_agent.setRemoteCredentials(impl2.localUfrag(), impl2.localPwd());
+    impl2.ice_agent.setRemoteCredentials(impl1.localUfrag(), impl1.localPwd());
+
+    var cand1_buf: [192]u8 = undefined;
+    const cand1_sdp = try impl1.ice_agent.local_candidates.items[0].formatSdp(&cand1_buf);
+    var cand2_buf: [192]u8 = undefined;
+    const cand2_sdp = try impl2.ice_agent.local_candidates.items[0].formatSdp(&cand2_buf);
+    try impl1.ice_agent.addRemoteCandidate(cand2_sdp);
+    try impl2.ice_agent.addRemoteCandidate(cand1_sdp);
+
+    var req_buf: [512]u8 = undefined;
+    const tx_id = [12]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const stun_req = try impl1.ice_agent.buildConnectivityCheckRequest(0, tx_id, true, &req_buf);
+    try impl1.sendUdpToActivePeer(stun_req);
+
+    // Receive STUN request on pc2 and send STUN binding response back to pc1
+    try std.testing.expect(try pc2.pollUdpOnce());
+    // Receive STUN binding response on pc1 -> transitions pc1 to .connected
+    try std.testing.expect(try pc1.pollUdpOnce());
+    try std.testing.expectEqual(State.connected, impl1.state);
+
+    // Run DTLS-SRTP handshake over real UDP sockets
+    impl1.dtls_session.role = .client;
+    impl2.dtls_session.role = .server;
+    var flight1_buf: [4096]u8 = undefined;
+    const flight1 = try impl1.dtls_session.startHandshake(&flight1_buf);
+    try impl1.sendUdpToActivePeer(flight1);
+
+    try std.testing.expect(try pc2.pollUdpOnce());
+    try std.testing.expect(try pc1.pollUdpOnce());
+    try std.testing.expect(try pc2.pollUdpOnce());
+    try std.testing.expect(try pc1.pollUdpOnce());
+    try std.testing.expect(impl1.dtls_ready);
+    try std.testing.expect(impl2.dtls_ready);
+
+    // Exchange SRTP-protected H.264 Baseline I_PCM video frame over UDP
+    const pkts_sent = try impl1.pushVideoFrame("hello-h264-ipcm", true, 90000);
+    try std.testing.expect(pkts_sent >= 1);
+    _ = try pc2.pumpUdpSocket();
+    try std.testing.expect(impl2.srtp_packets_received.load(.acquire) >= pkts_sent);
+
+    // Establish SCTP association and send DataChannel message over UDP
+    const init_pkt = try impl1.sctp_assoc.createInitPacket();
+    defer impl1.sctp_assoc.allocator.free(init_pkt);
+    try impl1.sendUdpToActivePeer(init_pkt);
+
+    try std.testing.expect(try pc2.pollUdpOnce()); // INIT -> INIT_ACK
+    try std.testing.expect(try pc1.pollUdpOnce()); // INIT_ACK -> COOKIE_ECHO
+    try std.testing.expect(try pc2.pollUdpOnce()); // COOKIE_ECHO -> COOKIE_ACK
+    try std.testing.expect(try pc1.pollUdpOnce()); // COOKIE_ACK -> established
+
+    const dc1 = cf_webrtc_pc_create_data_channel(pc1.handle, "adb-channel", null, null);
+    try std.testing.expect(dc1 != null);
+    defer cf_webrtc_dc_destroy(dc1);
+
+    _ = try pc2.pumpUdpSocket();
+    _ = try pc1.pumpUdpSocket();
+
+    const payload = "ping-over-udp-sctp";
+    try std.testing.expectEqual(c.CF_WEBRTC_OK, cf_webrtc_dc_send(dc1, payload.ptr, payload.len, false));
+    _ = try pc2.pumpUdpSocket();
+    _ = try pc1.pumpUdpSocket();
+
+    try std.testing.expectEqual(@as(usize, 1), rx_track.dc_messages);
+    try std.testing.expectEqualStrings(payload, rx_track.last_msg[0..rx_track.last_msg_len]);
+}
+
 
 

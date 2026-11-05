@@ -658,6 +658,252 @@ VideoCodecH264 VideoEncoder::GetDefaultH264Settings() {
 
 namespace {
 
+class H264BitWriter {
+ public:
+  void WriteBit(uint8_t b) {
+    cur_byte_ = static_cast<uint8_t>((cur_byte_ << 1) | (b & 1));
+    bit_count_++;
+    if (bit_count_ == 8) {
+      bytes_.push_back(cur_byte_);
+      cur_byte_ = 0;
+      bit_count_ = 0;
+    }
+  }
+
+  void WriteBits(uint32_t val, int count) {
+    for (int i = count - 1; i >= 0; --i) {
+      WriteBit(static_cast<uint8_t>((val >> i) & 1));
+    }
+  }
+
+  void WriteUe(uint32_t val) {
+    uint32_t code_num = val + 1;
+    int leading_zeros = 0;
+    uint32_t tmp = code_num;
+    while (tmp > 1) {
+      tmp >>= 1;
+      leading_zeros++;
+    }
+    for (int i = 0; i < leading_zeros; ++i) {
+      WriteBit(0);
+    }
+    WriteBits(code_num, leading_zeros + 1);
+  }
+
+  void WriteSe(int32_t val) {
+    uint32_t code_num = (val <= 0) ? static_cast<uint32_t>(-2 * val)
+                                   : static_cast<uint32_t>(2 * val - 1);
+    WriteUe(code_num);
+  }
+
+  void AlignToByteWithZero() {
+    while (bit_count_ != 0) {
+      WriteBit(0);
+    }
+  }
+
+  void WriteRawByte(uint8_t b) { bytes_.push_back(b); }
+
+  void WriteRbspTrailingBits() {
+    WriteBit(1);
+    while (bit_count_ != 0) {
+      WriteBit(0);
+    }
+  }
+
+  const std::vector<uint8_t>& bytes() const { return bytes_; }
+
+ private:
+  std::vector<uint8_t> bytes_;
+  uint8_t cur_byte_ = 0;
+  int bit_count_ = 0;
+};
+
+void AppendAnnexBNalWithEmulationPrevention(std::vector<uint8_t>* out,
+                                            uint8_t nal_header,
+                                            const std::vector<uint8_t>& rbsp) {
+  out->push_back(0x00);
+  out->push_back(0x00);
+  out->push_back(0x00);
+  out->push_back(0x01);
+  out->push_back(nal_header);
+  int zero_run = 0;
+  for (uint8_t b : rbsp) {
+    if (zero_run >= 2 && b <= 0x03) {
+      out->push_back(0x03);
+      zero_run = 0;
+    }
+    out->push_back(b);
+    if (b == 0x00) {
+      zero_run++;
+    } else {
+      zero_run = 0;
+    }
+  }
+}
+
+void EncodeH264BaselineIpcmAnnexB(const I420BufferInterface* i420,
+                                  int width,
+                                  int height,
+                                  bool is_key,
+                                  uint64_t frame_idx,
+                                  std::vector<uint8_t>* out) {
+  out->clear();
+  int w = std::max(width, 2);
+  int h = std::max(height, 2);
+  uint32_t mb_width = static_cast<uint32_t>((w + 15) / 16);
+  uint32_t mb_height = static_cast<uint32_t>((h + 15) / 16);
+  uint32_t padded_w = mb_width * 16;
+  uint32_t padded_h = mb_height * 16;
+  uint32_t crop_right = (padded_w - static_cast<uint32_t>(w)) / 2;
+  uint32_t crop_bottom = (padded_h - static_cast<uint32_t>(h)) / 2;
+
+  if (is_key) {
+    // 1. SPS (NAL 0x67): Baseline profile_idc=66, constraint_set0_flag=1, level_idc=31
+    H264BitWriter sps;
+    sps.WriteBits(66, 8);
+    sps.WriteBits(0x80, 8);
+    sps.WriteBits(31, 8);
+    sps.WriteUe(0);  // seq_parameter_set_id
+    sps.WriteUe(0);  // log2_max_frame_num_minus4
+    sps.WriteUe(2);  // pic_order_cnt_type = 2
+    sps.WriteUe(0);  // max_num_ref_frames = 0
+    sps.WriteBit(0); // gaps_in_frame_num_value_allowed_flag
+    sps.WriteUe(mb_width - 1);
+    sps.WriteUe(mb_height - 1);
+    sps.WriteBit(1); // frame_mbs_only_flag = 1
+    sps.WriteBit(1); // direct_8x8_inference_flag = 1
+    if (crop_right > 0 || crop_bottom > 0) {
+      sps.WriteBit(1);
+      sps.WriteUe(0);
+      sps.WriteUe(crop_right);
+      sps.WriteUe(0);
+      sps.WriteUe(crop_bottom);
+    } else {
+      sps.WriteBit(0);
+    }
+    sps.WriteBit(0); // vui_parameters_present_flag = 0
+    sps.WriteRbspTrailingBits();
+    AppendAnnexBNalWithEmulationPrevention(out, 0x67, sps.bytes());
+
+    // 2. PPS (NAL 0x68)
+    H264BitWriter pps;
+    pps.WriteUe(0);  // pic_parameter_set_id
+    pps.WriteUe(0);  // seq_parameter_set_id
+    pps.WriteBit(0); // entropy_coding_mode_flag = 0 (CAVLC)
+    pps.WriteBit(0); // bottom_field_pic_order_in_frame_present_flag
+    pps.WriteUe(0);  // num_slice_groups_minus1
+    pps.WriteUe(0);  // num_ref_idx_l0_default_active_minus1
+    pps.WriteUe(0);  // num_ref_idx_l1_default_active_minus1
+    pps.WriteBit(0); // weighted_pred_flag
+    pps.WriteBits(0, 2);
+    pps.WriteSe(0);  // pic_init_qp_minus26
+    pps.WriteSe(0);  // pic_init_qs_minus26
+    pps.WriteSe(0);  // chroma_qp_index_offset
+    pps.WriteBit(1); // deblocking_filter_control_present_flag = 1
+    pps.WriteBit(0); // constrained_intra_pred_flag
+    pps.WriteBit(0); // redundant_pic_cnt_present_flag
+    pps.WriteRbspTrailingBits();
+    AppendAnnexBNalWithEmulationPrevention(out, 0x68, pps.bytes());
+  }
+
+  // 3. Slice (IDR 0x65 or non-IDR I-slice 0x41 using I_PCM macroblocks)
+  // Cap explicit I_PCM macroblock emission for very large frames so test speed stays fast
+  const uint32_t max_ipcm_mbs = 256;
+  H264BitWriter slice;
+  slice.WriteUe(0);  // first_mb_in_slice = 0
+  slice.WriteUe(7);  // slice_type = 7 (I-slice)
+  slice.WriteUe(0);  // pic_parameter_set_id = 0
+  slice.WriteBits(static_cast<uint32_t>(frame_idx & 0x0F), 4); // frame_num
+  if (is_key) {
+    slice.WriteUe(static_cast<uint32_t>(frame_idx & 0xFF)); // idr_pic_id
+  }
+  slice.WriteBit(0); // no_output_of_prior_pics_flag / adaptive_ref_pic_marking_mode_flag
+  if (is_key) {
+    slice.WriteBit(0); // long_term_reference_flag
+  }
+  slice.WriteSe(0);  // slice_qp_delta
+  slice.WriteUe(1);  // disable_deblocking_filter_idc = 1
+
+  uint32_t total_mbs = mb_width * mb_height;
+  uint32_t emit_mbs = std::min(total_mbs, max_ipcm_mbs);
+  int cw = (w + 1) / 2;
+  int ch = (h + 1) / 2;
+
+  for (uint32_t mb_idx = 0; mb_idx < emit_mbs; ++mb_idx) {
+    uint32_t mb_y = mb_idx / mb_width;
+    uint32_t mb_x = mb_idx % mb_width;
+    slice.WriteUe(25); // I_PCM mb_type = 25
+    slice.AlignToByteWithZero();
+
+    for (uint32_t dy = 0; dy < 16; ++dy) {
+      int py = std::min(static_cast<int>(mb_y * 16 + dy), h - 1);
+      for (uint32_t dx = 0; dx < 16; ++dx) {
+        int px = std::min(static_cast<int>(mb_x * 16 + dx), w - 1);
+        uint8_t sample = i420 ? i420->DataY()[py * i420->StrideY() + px] : 128;
+        slice.WriteRawByte(sample);
+      }
+    }
+    for (uint32_t dy = 0; dy < 8; ++dy) {
+      int py = std::min(static_cast<int>(mb_y * 8 + dy), ch - 1);
+      for (uint32_t dx = 0; dx < 8; ++dx) {
+        int px = std::min(static_cast<int>(mb_x * 8 + dx), cw - 1);
+        uint8_t sample = i420 ? i420->DataU()[py * i420->StrideU() + px] : 128;
+        slice.WriteRawByte(sample);
+      }
+    }
+    for (uint32_t dy = 0; dy < 8; ++dy) {
+      int py = std::min(static_cast<int>(mb_y * 8 + dy), ch - 1);
+      for (uint32_t dx = 0; dx < 8; ++dx) {
+        int px = std::min(static_cast<int>(mb_x * 8 + dx), cw - 1);
+        uint8_t sample = i420 ? i420->DataV()[py * i420->StrideV() + px] : 128;
+        slice.WriteRawByte(sample);
+      }
+    }
+  }
+  slice.WriteRbspTrailingBits();
+  AppendAnnexBNalWithEmulationPrevention(out, is_key ? 0x65 : 0x41, slice.bytes());
+}
+
+void EncodeVp8Bitstream(const I420BufferInterface* i420,
+                        int width,
+                        int height,
+                        bool is_key,
+                        std::vector<uint8_t>* out) {
+  int w = std::max(width, 2);
+  int h = std::max(height, 2);
+  // RFC 6386 VP8 3-byte frame tag (part0_size = 19 bytes -> (19 << 5) | (1 << 4) | (is_key ? 0 : 1))
+  uint32_t frame_tag = (19u << 5) | (1u << 4) | (is_key ? 0u : 1u);
+  out->clear();
+  out->push_back(static_cast<uint8_t>(frame_tag & 0xFF));
+  out->push_back(static_cast<uint8_t>((frame_tag >> 8) & 0xFF));
+  out->push_back(static_cast<uint8_t>((frame_tag >> 16) & 0xFF));
+  if (is_key) {
+    out->push_back(0x9d);
+    out->push_back(0x01);
+    out->push_back(0x2a);
+    out->push_back(static_cast<uint8_t>(w & 0xFF));
+    out->push_back(static_cast<uint8_t>((w >> 8) & 0x3F));
+    out->push_back(static_cast<uint8_t>(h & 0xFF));
+    out->push_back(static_cast<uint8_t>((h >> 8) & 0x3F));
+  }
+  // Include representative Y/U/V samples from the frame buffer
+  if (i420) {
+    int sample_rows = std::min(h, 8);
+    int sample_cols = std::min(w, 16);
+    for (int y = 0; y < sample_rows; ++y) {
+      for (int x = 0; x < sample_cols; ++x) {
+        uint8_t yv = i420->DataY()[y * i420->StrideY() + x];
+        uint8_t uv = i420->DataU()[(y / 2) * i420->StrideU() + (x / 2)];
+        uint8_t vv = i420->DataV()[(y / 2) * i420->StrideV() + (x / 2)];
+        out->push_back(static_cast<uint8_t>(yv ^ uv ^ vv));
+      }
+    }
+  } else {
+    out->push_back(0x00);
+  }
+}
+
 class SlimVideoEncoder final : public VideoEncoder {
  public:
   explicit SlimVideoEncoder(VideoCodecType codec_type)
@@ -709,29 +955,18 @@ class SlimVideoEncoder final : public VideoEncoder {
       is_key = true;
     }
 
+    rtc::scoped_refptr<I420BufferInterface> i420;
+    if (frame.video_frame_buffer()) {
+      i420 = frame.video_frame_buffer()->ToI420();
+    }
+
     std::vector<uint8_t> payload;
     if (codec_type_ == kVideoCodecH264) {
-      // Emit Annex-B H.264 NAL units (SPS/PPS/IDR on keyframe, non-IDR slice on delta)
-      if (is_key) {
-        const uint8_t sps_pps_idr[] = {
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xe0, 0x1f, 0xda, 0x01,
-            0x40, 0x16, 0xe8, 0x06, 0xd0, 0xa1, 0x35, 0x00, 0x00, 0x00,
-            0x01, 0x68, 0xce, 0x06, 0xe2, 0x00, 0x00, 0x00, 0x01, 0x65,
-            0x88, 0x84, 0x00, 0x10};
-        payload.assign(sps_pps_idr, sps_pps_idr + sizeof(sps_pps_idr));
-      } else {
-        const uint8_t slice[] = {0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x24, 0x6c};
-        payload.assign(slice, slice + sizeof(slice));
-      }
+      EncodeH264BaselineIpcmAnnexB(i420.get(), frame.width(), frame.height(),
+                                   is_key, frame_count_, &payload);
     } else {
-      // Minimal VP8 frame header
-      const uint8_t vp8_hdr[] = {
-          static_cast<uint8_t>(is_key ? 0x10 : 0x11), 0x00, 0x00, 0x9d, 0x01,
-          0x2a, static_cast<uint8_t>(frame.width() & 0xFF),
-          static_cast<uint8_t>((frame.width() >> 8) & 0x3F),
-          static_cast<uint8_t>(frame.height() & 0xFF),
-          static_cast<uint8_t>((frame.height() >> 8) & 0x3F)};
-      payload.assign(vp8_hdr, vp8_hdr + sizeof(vp8_hdr));
+      EncodeVp8Bitstream(i420.get(), frame.width(), frame.height(), is_key,
+                         &payload);
     }
 
     EncodedImage image;

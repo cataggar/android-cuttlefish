@@ -1,0 +1,15 @@
+.{
+    .name = .cuttlefish_webrtc,
+    .version = "0.1.0",
+    .fingerprint = 0x839d0c77a6d7897a,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "base/cvd/build.zig",
+        "base/cvd/build.zig.zon",
+        "base/cvd/zig",
+        "base/cvd/cuttlefish",
+    },
+}

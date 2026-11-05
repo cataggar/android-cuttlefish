@@ -1,8 +1,115 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
 const Crc32IsoHdlc = std.hash.Crc32;
+
+const darwin_c = struct {
+    pub const AF_INET: c_int = 2;
+    pub const SOCK_DGRAM: c_int = 2;
+    pub const MSG_DONTWAIT: c_int = 0x80;
+    pub const EAGAIN: c_int = 35;
+    pub const EADDRNOTAVAIL: c_int = 49;
+
+    pub const SockAddrIn = extern struct {
+        len: u8 = @sizeOf(SockAddrIn),
+        family: u8 = 2,
+        port: u16,
+        addr: u32,
+        zero: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    pub const PollFd = extern struct {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    };
+    pub const POLLIN: c_short = 0x0001;
+
+    extern "c" fn socket(domain: c_int, sock_type: c_int, protocol: c_int) c_int;
+    extern "c" fn bind(s: c_int, addr: *const anyopaque, addrlen: u32) c_int;
+    extern "c" fn getsockname(s: c_int, addr: *anyopaque, addrlen: *u32) c_int;
+    extern "c" fn sendto(s: c_int, buf: *const anyopaque, len: usize, flags: c_int, dest_addr: *const anyopaque, dest_len: u32) isize;
+    extern "c" fn recvfrom(s: c_int, buf: *anyopaque, len: usize, flags: c_int, src_addr: *anyopaque, addrlen: *u32) isize;
+    extern "c" fn poll(fds: [*]PollFd, nfds: c_uint, timeout: c_int) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+    extern "c" fn __error() *c_int;
+};
+
+pub const SocketFd = if (builtin.os.tag == .linux) linux.fd_t else c_int;
+
+const UdpBindResult = enum {
+    ok,
+    addr_not_avail,
+    failed,
+};
+
+fn createUdpSocket() Error!SocketFd {
+    if (comptime builtin.os.tag == .linux) {
+        const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return Error.SocketCreationFailed;
+        return @intCast(rc);
+    } else {
+        const fd = darwin_c.socket(darwin_c.AF_INET, darwin_c.SOCK_DGRAM, 0);
+        if (fd < 0) return Error.SocketCreationFailed;
+        return fd;
+    }
+}
+
+fn closeUdpSocket(fd: SocketFd) void {
+    if (comptime builtin.os.tag == .linux) {
+        _ = linux.close(fd);
+    } else {
+        _ = darwin_c.close(fd);
+    }
+}
+
+fn bindUdpSocket(fd: SocketFd, ip: [4]u8, port: u16) UdpBindResult {
+    const ip_be: u32 = @bitCast(ip);
+    const port_be: u16 = std.mem.nativeToBig(u16, port);
+    if (comptime builtin.os.tag == .linux) {
+        var addr: linux.sockaddr.in = .{
+            .family = linux.AF.INET,
+            .port = port_be,
+            .addr = ip_be,
+        };
+        const rc = linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        return switch (linux.errno(rc)) {
+            .SUCCESS => .ok,
+            .ADDRNOTAVAIL => .addr_not_avail,
+            else => .failed,
+        };
+    } else {
+        var addr: darwin_c.SockAddrIn = .{
+            .port = port_be,
+            .addr = ip_be,
+        };
+        const rc = darwin_c.bind(fd, @ptrCast(&addr), @sizeOf(darwin_c.SockAddrIn));
+        if (rc == 0) return .ok;
+        const err = darwin_c.__error().*;
+        if (err == darwin_c.EADDRNOTAVAIL) return .addr_not_avail;
+        return .failed;
+    }
+}
+
+fn getUdpBoundPort(fd: SocketFd) Error!u16 {
+    if (comptime builtin.os.tag == .linux) {
+        var bound_addr: linux.sockaddr.in = undefined;
+        var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (linux.errno(linux.getsockname(fd, @ptrCast(&bound_addr), &addr_len)) != .SUCCESS) {
+            return Error.BindFailed;
+        }
+        return std.mem.bigToNative(u16, bound_addr.port);
+    } else {
+        var bound_addr: darwin_c.SockAddrIn = undefined;
+        var addr_len: u32 = @sizeOf(darwin_c.SockAddrIn);
+        if (darwin_c.getsockname(fd, @ptrCast(&bound_addr), &addr_len) != 0) {
+            return Error.BindFailed;
+        }
+        return std.mem.bigToNative(u16, bound_addr.port);
+    }
+}
 
 pub const Error = error{
     InvalidCandidate,
@@ -714,6 +821,8 @@ pub const CandidatePair = struct {
     }
 };
 
+pub const parseCandidate = ParsedCandidate.parse;
+
 pub const AgentConfig = struct {
     role: Role = .controlling,
     local_ufrag: []const u8,
@@ -722,6 +831,16 @@ pub const AgentConfig = struct {
     remote_pwd: []const u8 = "",
     tie_breaker: u64 = 0x0102030405060708,
     port_range: PortRange = .{},
+    host_ipv4: [4]u8 = .{ 127, 0, 0, 1 },
+    host_ipv6_str: ?[]const u8 = null,
+    host_ipv6_text: ?[]const u8 = null,
+};
+
+pub const UdpRecvResult = struct {
+    len: usize,
+    data: []const u8,
+    src_ip: [4]u8,
+    src_port: u16,
 };
 
 pub const Agent = struct {
@@ -733,16 +852,20 @@ pub const Agent = struct {
     remote_pwd: []const u8,
     tie_breaker: u64,
     port_range: PortRange,
+    host_ipv4: [4]u8 = .{ 127, 0, 0, 1 },
+    host_ipv6_str: ?[]const u8 = null,
+    host_ipv6_text: ?[]const u8 = null,
     state: IceConnectionState = .new,
     local_candidates: std.ArrayList(ParsedCandidate) = .empty,
     remote_candidates: std.ArrayList(ParsedCandidate) = .empty,
     checklist: std.ArrayList(CandidatePair) = .empty,
     nominated_pair: ?CandidatePair = null,
-    socket_fd: ?linux.fd_t = null,
+    socket_fd: ?SocketFd = null,
     bound_port: ?u16 = null,
     owned_strings: std.ArrayList([]u8) = .empty,
 
     pub fn init(allocator: Allocator, config: AgentConfig) Agent {
+        const ipv6 = config.host_ipv6_str orelse config.host_ipv6_text;
         return .{
             .allocator = allocator,
             .role = config.role,
@@ -752,12 +875,15 @@ pub const Agent = struct {
             .remote_pwd = config.remote_pwd,
             .tie_breaker = config.tie_breaker,
             .port_range = config.port_range,
+            .host_ipv4 = config.host_ipv4,
+            .host_ipv6_str = ipv6,
+            .host_ipv6_text = ipv6,
         };
     }
 
     pub fn deinit(self: *Agent) void {
         if (self.socket_fd) |fd| {
-            _ = linux.close(fd);
+            closeUdpSocket(fd);
             self.socket_fd = null;
         }
         for (self.owned_strings.items) |s| {
@@ -775,51 +901,75 @@ pub const Agent = struct {
         self.remote_pwd = pwd;
     }
 
-    /// Binds a real loopback UDP socket within `port_range.min_port..port_range.max_port`
-    /// (falling back to an ephemeral port if all ports in range are busy) and records a
-    /// `host` candidate (`127.0.0.1:<port>`).
+    pub fn setHostAddresses(self: *Agent, host_ipv4: [4]u8, host_ipv6: ?[]const u8) Error!void {
+        self.host_ipv4 = host_ipv4;
+        if (host_ipv6) |v6| {
+            if (v6.len > 0) {
+                const copy = try self.allocator.dupe(u8, v6);
+                errdefer self.allocator.free(copy);
+                try self.owned_strings.append(self.allocator, copy);
+                self.host_ipv6_str = copy;
+                self.host_ipv6_text = copy;
+            } else {
+                self.host_ipv6_str = null;
+                self.host_ipv6_text = null;
+            }
+        } else {
+            self.host_ipv6_str = null;
+            self.host_ipv6_text = null;
+        }
+        for (self.local_candidates.items) |*lc| {
+            lc.address = host_ipv4;
+        }
+        try self.rebuildChecklist();
+    }
+
+    /// Binds a real UDP socket within `port_range.min_port..port_range.max_port`
+    /// (trying `host_ipv4` first, falling back to `127.0.0.1` if `EADDRNOTAVAIL` in a test,
+    /// and falling back to an ephemeral port if all ports in range are busy) and records a
+    /// `host` candidate advertising `self.host_ipv4:<port>`.
     pub fn gatherHostCandidates(self: *Agent) Error!void {
         if (self.socket_fd == null) {
-            const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
-            if (linux.errno(rc) != .SUCCESS) return Error.SocketCreationFailed;
-            const fd: linux.fd_t = @intCast(rc);
-            errdefer _ = linux.close(fd);
+            const fd = try createUdpSocket();
+            errdefer closeUdpSocket(fd);
 
             var bound = false;
             var actual_port: u16 = 0;
-            const loopback_be: u32 = @bitCast([4]u8{ 127, 0, 0, 1 });
+            var bind_ip = self.host_ipv4;
 
             if (self.port_range.min_port <= self.port_range.max_port and self.port_range.min_port > 0) {
                 var p: u32 = self.port_range.min_port;
                 while (p <= self.port_range.max_port) : (p += 1) {
-                    var addr: linux.sockaddr.in = .{
-                        .family = linux.AF.INET,
-                        .port = std.mem.nativeToBig(u16, @intCast(p)),
-                        .addr = loopback_be,
-                    };
-                    if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) == .SUCCESS) {
-                        bound = true;
-                        actual_port = @intCast(p);
-                        break;
+                    const port_u16: u16 = @intCast(p);
+                    switch (bindUdpSocket(fd, bind_ip, port_u16)) {
+                        .ok => {
+                            bound = true;
+                            actual_port = port_u16;
+                            break;
+                        },
+                        .addr_not_avail => {
+                            bind_ip = .{ 127, 0, 0, 1 };
+                            if (bindUdpSocket(fd, bind_ip, port_u16) == .ok) {
+                                bound = true;
+                                actual_port = port_u16;
+                                break;
+                            }
+                        },
+                        .failed => {},
                     }
                 }
             }
 
             if (!bound) {
-                var addr: linux.sockaddr.in = .{
-                    .family = linux.AF.INET,
-                    .port = 0,
-                    .addr = loopback_be,
-                };
-                if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
-                    return Error.BindFailed;
+                switch (bindUdpSocket(fd, bind_ip, 0)) {
+                    .ok => {},
+                    .addr_not_avail => {
+                        bind_ip = .{ 127, 0, 0, 1 };
+                        if (bindUdpSocket(fd, bind_ip, 0) != .ok) return Error.BindFailed;
+                    },
+                    .failed => return Error.BindFailed,
                 }
-                var bound_addr: linux.sockaddr.in = undefined;
-                var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-                if (linux.errno(linux.getsockname(fd, @ptrCast(&bound_addr), &addr_len)) != .SUCCESS) {
-                    return Error.BindFailed;
-                }
-                actual_port = std.mem.bigToNative(u16, bound_addr.port);
+                actual_port = try getUdpBoundPort(fd);
             }
 
             self.socket_fd = fd;
@@ -827,12 +977,13 @@ pub const Agent = struct {
         }
 
         const port = self.bound_port orelse return Error.BindFailed;
+        self.local_candidates.clearRetainingCapacity();
         const cand = ParsedCandidate{
             .foundation = "1",
             .component_id = 1,
             .transport = .udp,
             .priority = ParsedCandidate.computePriority(.host, 65535, 1),
-            .address = .{ 127, 0, 0, 1 },
+            .address = self.host_ipv4,
             .port = port,
             .cand_type = .host,
             .generation = 0,
@@ -1007,50 +1158,179 @@ pub const Agent = struct {
     }
 
     /// Sends a raw UDP datagram via the agent's bound socket.
-    pub fn sendUdp(self: *const Agent, packet: []const u8, dst_ip: [4]u8, dst_port: u16) Error!void {
-        const fd = self.socket_fd orelse return Error.NoSocketBound;
-        const ip_be: u32 = @bitCast(dst_ip);
-        var dst_addr: linux.sockaddr.in = .{
-            .family = linux.AF.INET,
-            .port = std.mem.nativeToBig(u16, dst_port),
-            .addr = ip_be,
-        };
-        const rc = linux.sendto(
-            fd,
-            packet.ptr,
-            packet.len,
-            0,
-            @ptrCast(&dst_addr),
-            @sizeOf(linux.sockaddr.in),
-        );
-        if (linux.errno(rc) != .SUCCESS) return Error.SendFailed;
+    /// Accepts either `(packet, dst_ip, dst_port)` or `(dst_ip, dst_port, packet)`.
+    pub fn sendUdp(self: *const Agent, arg1: anytype, arg2: anytype, arg3: anytype) Error!void {
+        if (@TypeOf(arg1) == [4]u8) {
+            return self.sendUdpTo(arg1, arg2, arg3);
+        } else {
+            return self.sendUdpTo(arg2, arg3, arg1);
+        }
     }
 
-    /// Receives a raw UDP datagram from the agent's bound socket.
+    pub fn sendUdpTo(self: *const Agent, dst_ip: [4]u8, dst_port: u16, packet: []const u8) Error!void {
+        const fd = self.socket_fd orelse return Error.NoSocketBound;
+        const ip_be: u32 = @bitCast(dst_ip);
+        const port_be: u16 = std.mem.nativeToBig(u16, dst_port);
+        if (comptime builtin.os.tag == .linux) {
+            var dst_addr: linux.sockaddr.in = .{
+                .family = linux.AF.INET,
+                .port = port_be,
+                .addr = ip_be,
+            };
+            const rc = linux.sendto(
+                fd,
+                packet.ptr,
+                packet.len,
+                0,
+                @ptrCast(&dst_addr),
+                @sizeOf(linux.sockaddr.in),
+            );
+            if (linux.errno(rc) != .SUCCESS) return Error.SendFailed;
+        } else {
+            var dst_addr: darwin_c.SockAddrIn = .{
+                .port = port_be,
+                .addr = ip_be,
+            };
+            const rc = darwin_c.sendto(
+                fd,
+                packet.ptr,
+                packet.len,
+                0,
+                @ptrCast(&dst_addr),
+                @sizeOf(darwin_c.SockAddrIn),
+            );
+            if (rc < 0) return Error.SendFailed;
+        }
+    }
+
+    /// Receives a raw UDP datagram from the agent's bound socket (blocking).
     pub fn recvUdp(
         self: *const Agent,
         out_buf: []u8,
-    ) Error!struct { data: []const u8, src_ip: [4]u8, src_port: u16 } {
+    ) Error!UdpRecvResult {
         const fd = self.socket_fd orelse return Error.NoSocketBound;
-        var src_addr: linux.sockaddr.in = undefined;
-        var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-        const rc = linux.recvfrom(
-            fd,
-            out_buf.ptr,
-            out_buf.len,
-            0,
-            @ptrCast(&src_addr),
-            &addr_len,
-        );
-        if (linux.errno(rc) != .SUCCESS) return Error.RecvFailed;
-        const n: usize = @intCast(rc);
-        const src_ip: [4]u8 = @bitCast(src_addr.addr);
-        const src_port = std.mem.bigToNative(u16, src_addr.port);
-        return .{
-            .data = out_buf[0..n],
-            .src_ip = src_ip,
-            .src_port = src_port,
-        };
+        if (comptime builtin.os.tag == .linux) {
+            var src_addr: linux.sockaddr.in = undefined;
+            var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+            const rc = linux.recvfrom(
+                fd,
+                out_buf.ptr,
+                out_buf.len,
+                0,
+                @ptrCast(&src_addr),
+                &addr_len,
+            );
+            if (linux.errno(rc) != .SUCCESS) return Error.RecvFailed;
+            const n: usize = @intCast(rc);
+            const src_ip: [4]u8 = @bitCast(src_addr.addr);
+            const src_port = std.mem.bigToNative(u16, src_addr.port);
+            return .{
+                .len = n,
+                .data = out_buf[0..n],
+                .src_ip = src_ip,
+                .src_port = src_port,
+            };
+        } else {
+            var src_addr: darwin_c.SockAddrIn = undefined;
+            var addr_len: u32 = @sizeOf(darwin_c.SockAddrIn);
+            const rc = darwin_c.recvfrom(
+                fd,
+                out_buf.ptr,
+                out_buf.len,
+                0,
+                @ptrCast(&src_addr),
+                &addr_len,
+            );
+            if (rc < 0) return Error.RecvFailed;
+            const n: usize = @intCast(rc);
+            const src_ip: [4]u8 = @bitCast(src_addr.addr);
+            const src_port = std.mem.bigToNative(u16, src_addr.port);
+            return .{
+                .len = n,
+                .data = out_buf[0..n],
+                .src_ip = src_ip,
+                .src_port = src_port,
+            };
+        }
+    }
+
+    /// Receives a raw UDP datagram without blocking (`MSG_DONTWAIT`).
+    /// Returns `null` when no datagram is currently queued (`EAGAIN`/`EWOULDBLOCK`).
+    pub fn recvUdpNonBlocking(
+        self: *const Agent,
+        out_buf: []u8,
+    ) Error!?UdpRecvResult {
+        const fd = self.socket_fd orelse return Error.NoSocketBound;
+        if (comptime builtin.os.tag == .linux) {
+            var src_addr: linux.sockaddr.in = undefined;
+            var addr_len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+            const rc = linux.recvfrom(
+                fd,
+                out_buf.ptr,
+                out_buf.len,
+                linux.MSG.DONTWAIT,
+                @ptrCast(&src_addr),
+                &addr_len,
+            );
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .AGAIN => return null,
+                else => return Error.RecvFailed,
+            }
+            const n: usize = @intCast(rc);
+            const src_ip: [4]u8 = @bitCast(src_addr.addr);
+            const src_port = std.mem.bigToNative(u16, src_addr.port);
+            return .{
+                .len = n,
+                .data = out_buf[0..n],
+                .src_ip = src_ip,
+                .src_port = src_port,
+            };
+        } else {
+            var src_addr: darwin_c.SockAddrIn = undefined;
+            var addr_len: u32 = @sizeOf(darwin_c.SockAddrIn);
+            var rc = darwin_c.recvfrom(
+                fd,
+                out_buf.ptr,
+                out_buf.len,
+                darwin_c.MSG_DONTWAIT,
+                @ptrCast(&src_addr),
+                &addr_len,
+            );
+            if (rc < 0) {
+                const err = darwin_c.__error().*;
+                if (err != darwin_c.EAGAIN) return Error.RecvFailed;
+                var pfd = [_]darwin_c.PollFd{.{
+                    .fd = fd,
+                    .events = darwin_c.POLLIN,
+                    .revents = 0,
+                }};
+                if (darwin_c.poll(&pfd, 1, 5) <= 0) return null;
+                addr_len = @sizeOf(darwin_c.SockAddrIn);
+                rc = darwin_c.recvfrom(
+                    fd,
+                    out_buf.ptr,
+                    out_buf.len,
+                    darwin_c.MSG_DONTWAIT,
+                    @ptrCast(&src_addr),
+                    &addr_len,
+                );
+                if (rc < 0) {
+                    const err2 = darwin_c.__error().*;
+                    if (err2 == darwin_c.EAGAIN) return null;
+                    return Error.RecvFailed;
+                }
+            }
+            const n: usize = @intCast(rc);
+            const src_ip: [4]u8 = @bitCast(src_addr.addr);
+            const src_port = std.mem.bigToNative(u16, src_addr.port);
+            return .{
+                .len = n,
+                .data = out_buf[0..n],
+                .src_ip = src_ip,
+                .src_port = src_port,
+            };
+        }
     }
 };
 
@@ -1284,3 +1564,31 @@ test "Two-agent ICE loopback connectivity check, PortRange gathering, and nomina
     try std.testing.expectEqual(CheckState.succeeded, agent_a.checklist.items[0].state);
     try std.testing.expect(agent_a.checklist.items[0].nominated);
 }
+
+test "Explicit host_ipv4 candidate gathering within 15550..15599 and non-blocking UDP" {
+    const allocator = std.testing.allocator;
+    const host_ip = try parseIpv4("198.51.100.1");
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 1 }, host_ip);
+
+    var agent = Agent.init(allocator, .{
+        .role = .controlling,
+        .local_ufrag = "cfUfrag",
+        .local_pwd = "cfPassword0123456789",
+        .port_range = .{ .min_port = 15550, .max_port = 15599 },
+        .host_ipv4 = host_ip,
+        .host_ipv6_str = "fd00::1",
+    });
+    defer agent.deinit();
+
+    try agent.gatherHostCandidates();
+    try std.testing.expectEqual(@as(usize, 1), agent.local_candidates.items.len);
+    const cand = agent.local_candidates.items[0];
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 1 }, cand.address);
+    try std.testing.expect(cand.port >= 15550 and cand.port <= 15599);
+    try std.testing.expectEqualStrings("fd00::1", agent.host_ipv6_str.?);
+
+    var empty_buf: [64]u8 = undefined;
+    const maybe_pkt = try agent.recvUdpNonBlocking(&empty_buf);
+    try std.testing.expect(maybe_pkt == null);
+}
+

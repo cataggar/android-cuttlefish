@@ -8,6 +8,11 @@ pub const LibWebRtcArtifacts = struct {
     include_path: std.Build.LazyPath,
 };
 
+fn detectBasePrefix(b: *std.Build) []const u8 {
+    b.build_root.handle.access("base/cvd/zig/libwebrtc/root.zig", .{}) catch return "";
+    return "base/cvd/";
+}
+
 pub fn addLibWebRtc(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -15,7 +20,10 @@ pub fn addLibWebRtc(
 ) LibWebRtcArtifacts {
     const is_self_root = std.mem.endsWith(u8, b.root.root_dir.path orelse "", "zig/libwebrtc") or
         std.mem.endsWith(u8, b.root.sub_path, "zig/libwebrtc");
-    return addLibWebRtcAt(b, target, optimize, is_self_root);
+    if (is_self_root) {
+        return addLibWebRtcAt(b, target, optimize, true);
+    }
+    return addLibWebRtcWithPrefix(b, target, optimize, detectBasePrefix(b));
 }
 
 pub fn addLibWebRtcAt(
@@ -24,10 +32,32 @@ pub fn addLibWebRtcAt(
     optimize: std.builtin.OptimizeMode,
     is_self_root: bool,
 ) LibWebRtcArtifacts {
-    const dir_prefix = if (is_self_root) "" else "zig/libwebrtc/";
+    if (is_self_root) {
+        return addLibWebRtcFromDir(b, target, optimize, "", true);
+    }
+    return addLibWebRtcWithPrefix(b, target, optimize, detectBasePrefix(b));
+}
 
-    const include_path = b.path(if (is_self_root) "include" else "zig/libwebrtc/include");
-    const self_path = b.path(if (is_self_root) "." else "zig/libwebrtc");
+pub fn addLibWebRtcWithPrefix(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    base_prefix: []const u8,
+) LibWebRtcArtifacts {
+    const dir_prefix = b.fmt("{s}zig/libwebrtc/", .{base_prefix});
+    return addLibWebRtcFromDir(b, target, optimize, dir_prefix, false);
+}
+
+fn addLibWebRtcFromDir(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    dir_prefix: []const u8,
+    is_self_root: bool,
+) LibWebRtcArtifacts {
+    const include_path = b.path(if (is_self_root) "include" else b.fmt("{s}include", .{dir_prefix}));
+    const self_path = b.path(if (is_self_root) "." else std.mem.trimEnd(u8, dir_prefix, "/"));
+    const os_define: []const u8 = if (target.result.os.tag == .macos) "-DWEBRTC_MAC" else "-DWEBRTC_LINUX";
 
     const cpp_flags: []const []const u8 = &.{
         "-std=c++20",
@@ -36,7 +66,7 @@ pub fn addLibWebRtcAt(
         "-Wextra",
         "-Wno-unused-parameter",
         "-DWEBRTC_POSIX",
-        "-DWEBRTC_LINUX",
+        os_define,
         "-DWEBRTC_HAVE_SCTP",
         "-DWEBRTC_HAVE_DCSCTP",
         "-DWEBRTC_CODEC_OPUS",

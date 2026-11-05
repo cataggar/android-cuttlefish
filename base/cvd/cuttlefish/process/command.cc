@@ -54,8 +54,10 @@
 #include "cuttlefish/result/result.h"
 
 #ifdef __linux__
-#include <linux/prctl.h>
 #include <sys/prctl.h>
+#ifdef __GLIBC__
+#include <linux/prctl.h>
+#endif
 #endif
 
 extern char** environ;

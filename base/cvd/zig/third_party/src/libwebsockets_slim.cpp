@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+
 struct lws_vhost {
   int listen_fd = -1;
   int listen_port = -1;

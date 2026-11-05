@@ -53,6 +53,9 @@ comptime {
     _ = &pc.cf_webrtc_pc_create;
     _ = &pc.cf_webrtc_pc_add_video_track;
     _ = &pc.cf_webrtc_pc_add_audio_track;
+    _ = &pc.cf_webrtc_pc_set_ice_hosts;
+    _ = &pc.cf_webrtc_pc_poll_udp;
+    _ = &pc.cf_webrtc_pc_get_bound_port;
     _ = &pc.cf_webrtc_pc_create_offer;
     _ = &pc.cf_webrtc_pc_create_answer;
     _ = &pc.cf_webrtc_pc_set_local_description;

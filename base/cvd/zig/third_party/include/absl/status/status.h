@@ -183,7 +183,9 @@ inline StatusCode ErrnoToStatusCode(int error_number) {
       return StatusCode::kDeadlineExceeded;
     case ENODEV:
     case ENOENT:
+#ifdef ENOMEDIUM
     case ENOMEDIUM:
+#endif
     case ENXIO:
     case ESRCH:
       return StatusCode::kNotFound;
@@ -195,7 +197,9 @@ inline StatusCode ErrnoToStatusCode(int error_number) {
       return StatusCode::kAlreadyExists;
     case EPERM:
     case EACCES:
+#ifdef ENOKEY
     case ENOKEY:
+#endif
     case EROFS:
       return StatusCode::kPermissionDenied;
     case ENOTSUP:

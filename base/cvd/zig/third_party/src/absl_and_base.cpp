@@ -31,6 +31,14 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>

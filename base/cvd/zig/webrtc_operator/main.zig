@@ -1,21 +1,38 @@
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 pub const protocol = @import("protocol.zig");
+pub const os_socket = protocol.os_socket;
 pub const registry = @import("registry.zig");
 pub const unix_device_server = @import("unix_device_server.zig");
 pub const operator_server = @import("operator_server.zig");
 
 pub const CliConfig = struct {
+    http_server_address: []const u8 = "127.0.0.1",
     http_server_port: u16 = operator_server.DEFAULT_HTTP_PORT,
-    use_secure_http: bool = true,
+    use_secure_http: bool = false,
     assets_dir: []const u8 = operator_server.DEFAULT_ASSETS_DIR,
     certs_dir: []const u8 = "webrtc/certs",
     stun_server: []const u8 = operator_server.DEFAULT_STUN_SERVER,
     operator_socket_path: []const u8 = unix_device_server.DEFAULT_SOCKET_PATH,
     help: bool = false,
 };
+
+pub const CliOptions = CliConfig;
+pub const parseArgs = parseCliArgs;
+
+pub fn parseIpv4Be(str: []const u8) !u32 {
+    var octets: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, str, '.');
+    var idx: usize = 0;
+    while (it.next()) |part| : (idx += 1) {
+        if (idx >= 4 or part.len == 0) return error.InvalidAddress;
+        octets[idx] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidAddress;
+    }
+    if (idx != 4) return error.InvalidAddress;
+    return @bitCast(octets);
+}
 
 pub fn parseCliArgs(args: []const []const u8) !CliConfig {
     var cfg = CliConfig{};
@@ -54,7 +71,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliConfig {
 }
 
 fn applyFlag(cfg: *CliConfig, key: []const u8, val: []const u8) !void {
-    if (std.mem.eql(u8, key, "http_server_port")) {
+    if (std.mem.eql(u8, key, "http_server_address")) {
+        _ = try parseIpv4Be(val);
+        cfg.http_server_address = val;
+    } else if (std.mem.eql(u8, key, "http_server_port")) {
         cfg.http_server_port = try std.fmt.parseInt(u16, val, 10);
     } else if (std.mem.eql(u8, key, "use_secure_http")) {
         cfg.use_secure_http = parseBoolFlag(val);
@@ -96,17 +116,20 @@ pub fn main(init: std.process.Init) !void {
     if (cli.help) {
         const help_msg =
             \\Usage: webrtc_operator [flags]
+            \\  -http_server_address=<ipv4>     IPv4 address for HTTP server (default: 127.0.0.1)
             \\  -http_server_port=<port>        Port for HTTP/HTTPS server (default: 8443)
-            \\  -use_secure_http=<bool>         Whether to use HTTPS (default: true)
+            \\  -use_secure_http=<bool>         Whether to use HTTPS (default: false)
             \\  -assets_dir=<dir>               Directory with webp/static assets (default: webrtc)
             \\  -certs_dir=<dir>                Directory with TLS certificates (default: webrtc/certs)
             \\  -stun_server=<host:port>        STUN server address (default: stun.l.google.com:19302)
             \\  -operator_socket_path=<path>    UNIX socket path (default: /run/cuttlefish/operator)
             \\
         ;
-        _ = linux.write(linux.STDOUT_FILENO, help_msg.ptr, help_msg.len);
+        os_socket.writeStdout(help_msg);
         return;
     }
+
+    const host_ipv4_be = try parseIpv4Be(cli.http_server_address);
 
     var reg = registry.Registry.init(gpa);
     defer reg.deinit();
@@ -128,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var op_srv = operator_server.OperatorServer.init(gpa, &reg, .{
+        .host_ipv4_be = host_ipv4_be,
         .port = cli.http_server_port,
         .assets_dir = cli.assets_dir,
         .certs_dir = cli.certs_dir,
@@ -148,8 +172,13 @@ pub fn main(init: std.process.Init) !void {
 // Tests
 // ============================================================================
 
+comptime {
+    _ = unix_device_server;
+}
+
 test "CLI flag parsing supports -flag=val, --flag=val, and -flag val" {
     const args1 = [_][]const u8{
+        "--http_server_address=0.0.0.0",
         "-http_server_port=9443",
         "--use_secure_http=false",
         "-assets_dir=/opt/cf/webrtc",
@@ -158,6 +187,7 @@ test "CLI flag parsing supports -flag=val, --flag=val, and -flag val" {
         "--operator_socket_path=.custom_operator.sock",
     };
     const cfg1 = try parseCliArgs(&args1);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg1.http_server_address);
     try std.testing.expectEqual(@as(u16, 9443), cfg1.http_server_port);
     try std.testing.expectEqual(false, cfg1.use_secure_http);
     try std.testing.expectEqualStrings("/opt/cf/webrtc", cfg1.assets_dir);
@@ -166,6 +196,8 @@ test "CLI flag parsing supports -flag=val, --flag=val, and -flag val" {
     try std.testing.expectEqualStrings(".custom_operator.sock", cfg1.operator_socket_path);
 
     const args2 = [_][]const u8{
+        "--http_server_address",
+        "10.0.2.15",
         "-http_server_port",
         "8080",
         "-use_secure_http",
@@ -176,10 +208,39 @@ test "CLI flag parsing supports -flag=val, --flag=val, and -flag val" {
         "127.0.0.1:19302",
     };
     const cfg2 = try parseCliArgs(&args2);
+    try std.testing.expectEqualStrings("10.0.2.15", cfg2.http_server_address);
     try std.testing.expectEqual(@as(u16, 8080), cfg2.http_server_port);
     try std.testing.expectEqual(true, cfg2.use_secure_http);
     try std.testing.expectEqualStrings("custom_assets", cfg2.assets_dir);
     try std.testing.expectEqualStrings("127.0.0.1:19302", cfg2.stun_server);
+
+    const args_explicit_true = [_][]const u8{"-use_secure_http=true"};
+    const cfg_explicit_true = try parseArgs(&args_explicit_true);
+    try std.testing.expectEqual(true, cfg_explicit_true.use_secure_http);
+
+    const args_explicit_false = [_][]const u8{"-use_secure_http=false"};
+    const cfg_explicit_false = try parseArgs(&args_explicit_false);
+    try std.testing.expectEqual(false, cfg_explicit_false.use_secure_http);
+}
+
+test "parseArgs parses standalone operator argv and defaults use_secure_http to false" {
+    const standalone_argv = [_][]const u8{
+        "--http_server_address=127.0.0.1",
+        "--http_server_port=8443",
+        "--assets_dir=/tmp/assets",
+        "--operator_socket_path=/tmp/op.sock",
+    };
+    const opts = try parseArgs(&standalone_argv);
+    try std.testing.expectEqualStrings("127.0.0.1", opts.http_server_address);
+    try std.testing.expectEqual(@as(u16, 8443), opts.http_server_port);
+    try std.testing.expectEqualStrings("/tmp/assets", opts.assets_dir);
+    try std.testing.expectEqualStrings("/tmp/op.sock", opts.operator_socket_path);
+    try std.testing.expectEqual(false, opts.use_secure_http);
+    try std.testing.expectEqual(@as(u32, @bitCast([4]u8{ 127, 0, 0, 1 })), try parseIpv4Be(opts.http_server_address));
+
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Be("256.0.0.1"));
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Be("127.0.1"));
+    try std.testing.expectError(error.InvalidAddress, parseIpv4Be("not-an-ip"));
 }
 
 test "protocol.zig JSON formatting and parsing" {
@@ -337,24 +398,17 @@ test "registry.zig device and client lifecycle" {
 }
 
 fn connectLoopbackTcp(port: u16) !i32 {
-    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
-    const fd: i32 = @intCast(rc);
-    errdefer _ = linux.close(fd);
+    const fd = try os_socket.socketTcp();
+    errdefer os_socket.close(fd);
 
-    var addr: linux.sockaddr.in = .{
-        .family = linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
-    };
-    const conn_rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-    if (linux.errno(conn_rc) != .SUCCESS) return error.ConnectFailed;
+    const addr = os_socket.initSockAddrIn(try parseIpv4Be("127.0.0.1"), port);
+    try os_socket.connectIn(fd, &addr);
     return fd;
 }
 
 fn sendSimpleHttpRequest(allocator: Allocator, port: u16, raw_request: []const u8) ![]u8 {
     const fd = try connectLoopbackTcp(port);
-    defer _ = linux.close(fd);
+    defer os_socket.close(fd);
 
     try registry.sendAllRaw(fd, raw_request);
 
@@ -363,15 +417,9 @@ fn sendSimpleHttpRequest(allocator: Allocator, port: u16, raw_request: []const u
 
     var buf: [4096]u8 = undefined;
     while (true) {
-        const rc = linux.recvfrom(fd, &buf, buf.len, 0, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) break;
-                try resp.appendSlice(allocator, buf[0..rc]);
-            },
-            .INTR => continue,
-            else => return error.ReadFailed,
-        }
+        const n = try os_socket.recv(fd, &buf);
+        if (n == 0) break;
+        try resp.appendSlice(allocator, buf[0..n]);
     }
     return resp.toOwnedSlice(allocator);
 }
@@ -379,21 +427,6 @@ fn sendSimpleHttpRequest(allocator: Allocator, port: u16, raw_request: []const u
 fn extractHttpBody(resp: []const u8) ![]const u8 {
     const sep = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.InvalidHttpResponse;
     return resp[sep + 4 ..];
-}
-
-fn readSeqPacket(allocator: Allocator, fd: i32) ![]u8 {
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const rc = linux.recvfrom(fd, &buf, buf.len, 0, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.EndOfStream;
-                return try allocator.dupe(u8, buf[0..rc]);
-            },
-            .INTR => continue,
-            else => return error.SocketReadFailed,
-        }
-    }
 }
 
 test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTTP + WebSocket)" {
@@ -412,10 +445,16 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     );
     defer unix_srv.deinit();
     try unix_srv.start();
-    try std.testing.expectEqual(unix_device_server.SocketMode.seqpacket, unix_srv.active_mode);
+    if (builtin.os.tag == .macos) {
+        try std.testing.expectEqual(unix_device_server.SocketMode.stream, unix_srv.active_mode);
+        try std.testing.expectEqual(unix_device_server.SocketMode.stream, unix_srv.config.mode);
+    } else {
+        try std.testing.expectEqual(unix_device_server.SocketMode.seqpacket, unix_srv.active_mode);
+        try std.testing.expectEqual(unix_device_server.SocketMode.seqpacket, unix_srv.config.mode);
+    }
 
     var op_srv = operator_server.OperatorServer.init(allocator, &reg, .{
-        .host_ipv4_be = std.mem.nativeToBig(u32, 0x7f000001),
+        .host_ipv4_be = try parseIpv4Be("127.0.0.1"),
         .port = 0, // ephemeral port
         .stun_server = "stun.l.google.com:19302",
     });
@@ -424,26 +463,14 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     const port = op_srv.bound_port;
     try std.testing.expect(port > 0);
 
-    // 1. Connect simulated device over UNIX SOCK_SEQPACKET
-    const dev_rc = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC, 0);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(dev_rc));
-    const dev_fd: i32 = @intCast(dev_rc);
-    defer _ = linux.close(dev_fd);
-
-    var un_addr: linux.sockaddr.un = .{
-        .family = linux.AF.UNIX,
-        .path = @splat(0),
-    };
-    @memcpy(un_addr.path[0..sock_path.len], sock_path);
-    try std.testing.expectEqual(
-        linux.E.SUCCESS,
-        linux.errno(linux.connect(dev_fd, @ptrCast(&un_addr), @sizeOf(linux.sockaddr.un))),
-    );
+    // 1. Connect simulated device over UNIX socket (SEQPACKET on Linux, STREAM+4B header fallback on macOS)
+    const dev_fd = try unix_device_server.connectSeqpacketClient(&unix_srv);
+    defer os_socket.close(dev_fd);
 
     const reg_pkt = "{\"message_type\":\"register\",\"device_id\":\"cvd-1\",\"device_port\":8443,\"device_info\":{\"displays\":[{\"width\":720,\"height\":1280}]}}";
-    try registry.sendPacketRaw(dev_fd, reg_pkt);
+    try unix_device_server.sendSeqpacketClientMsg(dev_fd, unix_srv.config.mode, reg_pkt);
 
-    const cfg_pkt = try readSeqPacket(allocator, dev_fd);
+    const cfg_pkt = try unix_device_server.recvSeqpacketClientMsg(allocator, dev_fd, unix_srv.config.mode);
     defer allocator.free(cfg_pkt);
     try std.testing.expectEqualStrings(
         "{\"message_type\":\"config\",\"ice_servers\":[{\"urls\":[\"stun:stun.l.google.com:19302\"]}]}",
@@ -512,7 +539,7 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     try std.testing.expectEqualStrings("[]", try extractHttpBody(fwd_resp));
 
     // Verify UNIX device received client_msg for client_id 1
-    const dev_recv_1 = try readSeqPacket(allocator, dev_fd);
+    const dev_recv_1 = try unix_device_server.recvSeqpacketClientMsg(allocator, dev_fd, unix_srv.config.mode);
     defer allocator.free(dev_recv_1);
     try std.testing.expectEqualStrings(
         "{\"message_type\":\"client_msg\",\"client_id\":1,\"payload\":{\"type\":\"offer\",\"sdp\":\"v=0\"}}",
@@ -520,8 +547,9 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     );
 
     // Send reply from UNIX device -> polling client 1
-    try registry.sendPacketRaw(
+    try unix_device_server.sendSeqpacketClientMsg(
         dev_fd,
+        unix_srv.config.mode,
         "{\"message_type\":\"forward\",\"client_id\":1,\"payload\":{\"type\":\"answer\",\"sdp\":\"v=0-ans\"}}",
     );
 
@@ -555,7 +583,7 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
 
     // 5. Test WebSocket /connect_client upgrade & bidirectional frame relay
     const ws_fd = try connectLoopbackTcp(port);
-    defer _ = linux.close(ws_fd);
+    defer os_socket.close(ws_fd);
 
     const upgrade_req =
         "GET /connect_client HTTP/1.1\r\n" ++
@@ -572,10 +600,9 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     var upgrade_len: usize = 0;
     var hdr_end: ?usize = null;
     while (hdr_end == null) {
-        const rc = linux.recvfrom(ws_fd, upgrade_buf[upgrade_len..].ptr, upgrade_buf.len - upgrade_len, 0, null, null);
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-        try std.testing.expect(rc > 0);
-        upgrade_len += rc;
+        const n = try os_socket.recv(ws_fd, upgrade_buf[upgrade_len..]);
+        try std.testing.expect(n > 0);
+        upgrade_len += n;
         hdr_end = std.mem.indexOf(u8, upgrade_buf[0..upgrade_len], "\r\n\r\n");
     }
     const upgrade_headers = upgrade_buf[0 .. hdr_end.? + 2];
@@ -622,7 +649,7 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     try registry.sendAllRaw(ws_fd, ws_fwd_frame);
 
     // Verify UNIX device receives client_msg for client_id 2
-    const dev_recv_2 = try readSeqPacket(allocator, dev_fd);
+    const dev_recv_2 = try unix_device_server.recvSeqpacketClientMsg(allocator, dev_fd, unix_srv.config.mode);
     defer allocator.free(dev_recv_2);
     try std.testing.expectEqualStrings(
         "{\"message_type\":\"client_msg\",\"client_id\":2,\"payload\":{\"candidate\":\"cand-1\"}}",
@@ -630,8 +657,9 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     );
 
     // Send device -> WebSocket client 2
-    try registry.sendPacketRaw(
+    try unix_device_server.sendSeqpacketClientMsg(
         dev_fd,
+        unix_srv.config.mode,
         "{\"message_type\":\"forward\",\"client_id\":2,\"payload\":{\"candidate\":\"cand-2\"}}",
     );
 
@@ -646,7 +674,7 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     const close_masked = [_]u8{ 0x88, 0x80, 0x01, 0x02, 0x03, 0x04 };
     try registry.sendAllRaw(ws_fd, &close_masked);
 
-    const dev_disc = try readSeqPacket(allocator, dev_fd);
+    const dev_disc = try unix_device_server.recvSeqpacketClientMsg(allocator, dev_fd, unix_srv.config.mode);
     defer allocator.free(dev_disc);
     try std.testing.expectEqualStrings(
         "{\"message_type\":\"client_disconnected\",\"client_id\":2}",

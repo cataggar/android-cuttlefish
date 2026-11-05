@@ -1,70 +1,61 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
+const os_socket = protocol.os_socket;
 
 pub const MAX_POLL_QUEUE_LEN: usize = 1000;
 pub const CONNECTION_ID_LEN: usize = 64;
 
-/// Futex-backed thread-safe mutex compatible with Zig 0.17.0 without requiring an Io context.
+/// Futex-backed thread-safe mutex on Linux; atomic spin-yield mutex on macOS.
 pub const Mutex = struct {
     state: std.atomic.Value(u32) = .init(0), // 0 = unlocked, 1 = locked, 2 = contended
 
     pub fn lock(self: *Mutex) void {
         if (self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
         while (self.state.swap(2, .acquire) != 0) {
-            _ = linux.futex_4arg(
-                @ptrCast(&self.state.raw),
-                .{ .cmd = .WAIT, .private = true },
-                2,
-                null,
-            );
+            if (builtin.os.tag == .linux) {
+                _ = linux.futex_4arg(
+                    @ptrCast(&self.state.raw),
+                    .{ .cmd = .WAIT, .private = true },
+                    2,
+                    null,
+                );
+            } else {
+                std.Thread.yield() catch {};
+            }
         }
     }
 
     pub fn unlock(self: *Mutex) void {
         const prev = self.state.swap(0, .release);
         if (prev == 2) {
-            _ = linux.futex_3arg(
-                @ptrCast(&self.state.raw),
-                .{ .cmd = .WAKE, .private = true },
-                1,
-            );
+            if (builtin.os.tag == .linux) {
+                _ = linux.futex_3arg(
+                    @ptrCast(&self.state.raw),
+                    .{ .cmd = .WAKE, .private = true },
+                    1,
+                );
+            }
         }
     }
 };
 
 pub fn sendAllRaw(fd: i32, data: []const u8) !void {
-    var sent: usize = 0;
-    while (sent < data.len) {
-        const rc = linux.sendto(fd, data[sent..].ptr, data.len - sent, linux.MSG.NOSIGNAL, null, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                if (rc == 0) return error.BrokenPipe;
-                sent += rc;
-            },
-            .INTR => continue,
-            .AGAIN => {
-                std.Thread.yield() catch {};
-                continue;
-            },
-            else => return error.SocketSendFailed,
-        }
-    }
+    os_socket.sendAll(fd, data) catch return error.SocketSendFailed;
 }
 
 pub fn sendPacketRaw(fd: i32, data: []const u8) !void {
-    while (true) {
-        const rc = linux.sendto(fd, data.ptr, data.len, linux.MSG.NOSIGNAL, null, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .AGAIN => {
-                std.Thread.yield() catch {};
-                continue;
-            },
-            else => return error.SocketSendFailed,
-        }
+    os_socket.sendPacket(fd, data) catch return error.SocketSendFailed;
+}
+
+pub fn sendStreamFramedRaw(fd: i32, data: []const u8) !void {
+    var len_hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_hdr, @intCast(data.len), .big);
+    try sendAllRaw(fd, &len_hdr);
+    if (data.len > 0) {
+        try sendAllRaw(fd, data);
     }
 }
 
@@ -97,6 +88,7 @@ pub const CallbackSink = struct {
 pub const DeviceSink = union(enum) {
     unix_seqpacket_fd: i32,
     unix_stream_fd: i32,
+    unix_stream_framed_fd: i32,
     websocket_fd: i32,
     callback: CallbackSink,
 
@@ -104,6 +96,7 @@ pub const DeviceSink = union(enum) {
         switch (self) {
             .unix_seqpacket_fd => |fd| try sendPacketRaw(fd, data),
             .unix_stream_fd => |fd| try sendAllRaw(fd, data),
+            .unix_stream_framed_fd => |fd| try sendStreamFramedRaw(fd, data),
             .websocket_fd => |fd| try sendWebSocketTextFrame(fd, data),
             .callback => |cb| try cb.send_fn(cb.ctx, data),
         }
@@ -157,7 +150,7 @@ pub const ClientEntry = struct {
 fn generateConnectionId() [CONNECTION_ID_LEN]u8 {
     const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     var random_bytes: [CONNECTION_ID_LEN]u8 = undefined;
-    _ = linux.getrandom(&random_bytes, random_bytes.len, 0);
+    os_socket.fillRandom(&random_bytes);
     var out: [CONNECTION_ID_LEN]u8 = undefined;
     for (random_bytes, 0..) |b, i| {
         out[i] = charset[b % charset.len];

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<!--
+ Copyright (C) 2020 The Android Open Source Project
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cuttlefish WebRTC Operator</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+        background: #121212;
+        color: #f5f5f5;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 20px;
+        background: #1e1e1e;
+        border-bottom: 1px solid #333;
+      }
+      #device-list {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .device-btn {
+        background: #2c2c2c;
+        color: #fff;
+        border: 1px solid #444;
+        border-radius: 6px;
+        padding: 6px 14px;
+        cursor: pointer;
+        text-decoration: none;
+        font-size: 14px;
+      }
+      .device-btn:hover {
+        background: #3d5afe;
+        border-color: #536dfe;
+      }
+      #client-frame {
+        width: 100vw;
+        height: calc(100vh - 54px);
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>Cuttlefish WebRTC Devices</strong>
+      <div id="device-list">Loading devices...</div>
+    </header>
+    <iframe id="client-frame" title="Cuttlefish Device Display"></iframe>
+    <script>
+      async function refreshDevices() {
+        const listEl = document.getElementById('device-list');
+        const frameEl = document.getElementById('client-frame');
+        try {
+          const res = await fetch('/devices', { cache: 'no-store' });
+          const devices = await res.json();
+          listEl.textContent = '';
+          if (!Array.isArray(devices) || devices.length === 0) {
+            listEl.textContent = 'No registered devices';
+            return;
+          }
+          devices.forEach((entry, idx) => {
+            const devId = typeof entry === 'string' ? entry : entry.device_id;
+            if (!devId) return;
+            const link = document.createElement('a');
+            link.className = 'device-btn';
+            link.href = `/client.html?v=2&deviceId=${encodeURIComponent(devId)}`;
+            link.textContent = devId;
+            link.addEventListener('click', (evt) => {
+              evt.preventDefault();
+              frameEl.src = link.href;
+            });
+            listEl.appendChild(link);
+            if (idx === 0 && !frameEl.src) {
+              frameEl.src = link.href;
+            }
+          });
+        } catch (err) {
+          listEl.textContent = 'Waiting for operator...';
+        }
+      }
+      refreshDevices();
+      setInterval(refreshDevices, 5000);
+    </script>
+  </body>
+</html>

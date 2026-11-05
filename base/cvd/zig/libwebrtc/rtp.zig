@@ -1000,6 +1000,294 @@ pub const H264Depacketizer = struct {
 };
 
 // ============================================================================
+// H.264 Baseline Profile I_PCM Annex-B Encoder (ITU-T H.264 / ISO 14496-10)
+// ============================================================================
+
+const BitWriter = struct {
+    buf: []u8,
+    byte_pos: usize = 0,
+    bit_pos: u3 = 0, // 0..7, MSB first
+
+    pub fn writeBit(self: *BitWriter, bit: u1) Error!void {
+        if (self.byte_pos >= self.buf.len) return error.BufferTooSmall;
+        if (self.bit_pos == 0) {
+            self.buf[self.byte_pos] = 0;
+        }
+        const shift: u3 = @intCast(7 - @as(u4, self.bit_pos));
+        self.buf[self.byte_pos] |= (@as(u8, bit) << shift);
+        if (self.bit_pos == 7) {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        } else {
+            self.bit_pos += 1;
+        }
+    }
+
+    pub fn writeBits(self: *BitWriter, val: u32, count: u6) Error!void {
+        var i: u6 = count;
+        while (i > 0) {
+            i -= 1;
+            const b: u1 = @truncate((val >> @intCast(i)) & 1);
+            try self.writeBit(b);
+        }
+    }
+
+    pub fn writeUe(self: *BitWriter, code_num: u32) Error!void {
+        const val: u64 = @as(u64, code_num) + 1;
+        const bit_len: u6 = @intCast(64 - @clz(val));
+        const leading_zeros: u6 = bit_len - 1;
+        var z: u6 = 0;
+        while (z < leading_zeros) : (z += 1) {
+            try self.writeBit(0);
+        }
+        try self.writeBits(@truncate(val), bit_len);
+    }
+
+    pub fn writeSe(self: *BitWriter, val: i32) Error!void {
+        const code_num: u32 = if (val <= 0)
+            @as(u32, @intCast(-val)) * 2
+        else
+            @as(u32, @intCast(val)) * 2 - 1;
+        try self.writeUe(code_num);
+    }
+
+    pub fn alignToByteWithZeros(self: *BitWriter) Error!void {
+        while (self.bit_pos != 0) {
+            try self.writeBit(0);
+        }
+    }
+
+    pub fn writeRbspTrailingBits(self: *BitWriter) Error!void {
+        try self.writeBit(1);
+        try self.alignToByteWithZeros();
+    }
+
+    pub fn writtenSlice(self: *const BitWriter) []const u8 {
+        const len = if (self.bit_pos == 0) self.byte_pos else self.byte_pos + 1;
+        return self.buf[0..len];
+    }
+};
+
+fn appendAnnexBNalWithEp(
+    out_buf: []u8,
+    pos: *usize,
+    nal_header: u8,
+    rbsp: []const u8,
+) Error!void {
+    if (pos.* + 5 > out_buf.len) return error.BufferTooSmall;
+    @memcpy(out_buf[pos.* .. pos.* + 4], &ANNEXB_START_CODE);
+    pos.* += 4;
+    out_buf[pos.*] = nal_header;
+    pos.* += 1;
+
+    var zero_count: usize = 0;
+    for (rbsp) |b| {
+        if (zero_count >= 2 and b <= 0x03) {
+            if (pos.* >= out_buf.len) return error.BufferTooSmall;
+            out_buf[pos.*] = 0x03;
+            pos.* += 1;
+            zero_count = 0;
+        }
+        if (pos.* >= out_buf.len) return error.BufferTooSmall;
+        out_buf[pos.*] = b;
+        pos.* += 1;
+        if (b == 0x00) {
+            zero_count += 1;
+        } else {
+            zero_count = 0;
+        }
+    }
+}
+
+/// Encodes an arbitrary `width x height` I420 frame into a browser-decodable
+/// H.264 Baseline Profile (`profile_idc = 66, constraint_set0_flag = 1, level_idc = 31`)
+/// Annex-B access unit containing SPS (`0x67`), PPS (`0x68`), and an IDR slice (`0x65`)
+/// with `I_PCM` (`mb_type = 25`) macroblocks and RBSP `0x00 0x00 0x03` emulation prevention.
+pub fn encodeH264BaselineIpcmFrame(
+    y_plane: []const u8,
+    u_plane: []const u8,
+    v_plane: []const u8,
+    width: u16,
+    height: u16,
+    y_stride: usize,
+    uv_stride: usize,
+    out_buf: []u8,
+) Error![]const u8 {
+    if (width == 0 or height == 0) return error.InvalidH264Packet;
+    const w: usize = width;
+    const h: usize = height;
+    const uv_w: usize = (w + 1) / 2;
+    const uv_h: usize = (h + 1) / 2;
+    if (y_stride < w or uv_stride < uv_w) return error.InvalidH264Packet;
+    if (y_plane.len < (h - 1) * y_stride + w) return error.BufferTooSmall;
+    if (u_plane.len < (uv_h - 1) * uv_stride + uv_w) return error.BufferTooSmall;
+    if (v_plane.len < (uv_h - 1) * uv_stride + uv_w) return error.BufferTooSmall;
+
+    const mb_width: u32 = (@as(u32, width) + 15) / 16;
+    const mb_height: u32 = (@as(u32, height) + 15) / 16;
+    const padded_w: u32 = mb_width * 16;
+    const padded_h: u32 = mb_height * 16;
+    const crop_right: u32 = (padded_w - @as(u32, width)) / 2;
+    const crop_bottom: u32 = (padded_h - @as(u32, height)) / 2;
+
+    var out_pos: usize = 0;
+
+    // 1. SPS (nal_ref_idc = 3, nal_unit_type = 7 => 0x67)
+    var sps_rbsp_buf: [64]u8 = undefined;
+    var sps_bw = BitWriter{ .buf = &sps_rbsp_buf };
+    try sps_bw.writeBits(66, 8); // profile_idc = 66 (Baseline)
+    try sps_bw.writeBit(1); // constraint_set0_flag = 1
+    try sps_bw.writeBit(1); // constraint_set1_flag = 1
+    try sps_bw.writeBit(1); // constraint_set2_flag = 1
+    try sps_bw.writeBit(0); // constraint_set3_flag = 0
+    try sps_bw.writeBits(0, 4); // reserved_zero_4bits
+    try sps_bw.writeBits(31, 8); // level_idc = 31
+    try sps_bw.writeUe(0); // seq_parameter_set_id = 0
+    try sps_bw.writeUe(0); // log2_max_frame_num_minus4 = 0
+    try sps_bw.writeUe(2); // pic_order_cnt_type = 2
+    try sps_bw.writeUe(1); // max_num_ref_frames = 1
+    try sps_bw.writeBit(0); // gaps_in_frame_num_value_allowed_flag = 0
+    try sps_bw.writeUe(mb_width - 1); // pic_width_in_mbs_minus1
+    try sps_bw.writeUe(mb_height - 1); // pic_height_in_map_units_minus1
+    try sps_bw.writeBit(1); // frame_mbs_only_flag = 1
+    try sps_bw.writeBit(1); // direct_8x8_inference_flag = 1
+    if (crop_right > 0 or crop_bottom > 0) {
+        try sps_bw.writeBit(1); // frame_cropping_flag = 1
+        try sps_bw.writeUe(0); // frame_crop_left_offset
+        try sps_bw.writeUe(crop_right); // frame_crop_right_offset
+        try sps_bw.writeUe(0); // frame_crop_top_offset
+        try sps_bw.writeUe(crop_bottom); // frame_crop_bottom_offset
+    } else {
+        try sps_bw.writeBit(0); // frame_cropping_flag = 0
+    }
+    try sps_bw.writeBit(0); // vui_parameters_present_flag = 0
+    try sps_bw.writeRbspTrailingBits();
+    try appendAnnexBNalWithEp(out_buf, &out_pos, 0x67, sps_bw.writtenSlice());
+
+    // 2. PPS (nal_ref_idc = 3, nal_unit_type = 8 => 0x68)
+    var pps_rbsp_buf: [32]u8 = undefined;
+    var pps_bw = BitWriter{ .buf = &pps_rbsp_buf };
+    try pps_bw.writeUe(0); // pic_parameter_set_id = 0
+    try pps_bw.writeUe(0); // seq_parameter_set_id = 0
+    try pps_bw.writeBit(0); // entropy_coding_mode_flag = 0 (CAVLC)
+    try pps_bw.writeBit(0); // bottom_field_pic_order_in_frame_present_flag = 0
+    try pps_bw.writeUe(0); // num_slice_groups_minus1 = 0
+    try pps_bw.writeUe(0); // num_ref_idx_l0_default_active_minus1 = 0
+    try pps_bw.writeUe(0); // num_ref_idx_l1_default_active_minus1 = 0
+    try pps_bw.writeBit(0); // weighted_pred_flag = 0
+    try pps_bw.writeBits(0, 2); // weighted_bipred_idc = 0
+    try pps_bw.writeSe(0); // pic_init_qp_minus26 = 0
+    try pps_bw.writeSe(0); // pic_init_qs_minus26 = 0
+    try pps_bw.writeSe(0); // chroma_qp_index_offset = 0
+    try pps_bw.writeBit(1); // deblocking_filter_control_present_flag = 1
+    try pps_bw.writeBit(0); // constrained_intra_pred_flag = 0
+    try pps_bw.writeBit(0); // redundant_pic_cnt_present_flag = 0
+    try pps_bw.writeRbspTrailingBits();
+    try appendAnnexBNalWithEp(out_buf, &out_pos, 0x68, pps_bw.writtenSlice());
+
+    // 3. IDR Slice (nal_ref_idc = 3, nal_unit_type = 5 => 0x65)
+    // Stream RBSP directly through an emulation-prevention writer into out_buf
+    if (out_pos + 5 > out_buf.len) return error.BufferTooSmall;
+    @memcpy(out_buf[out_pos .. out_pos + 4], &ANNEXB_START_CODE);
+    out_pos += 4;
+    out_buf[out_pos] = 0x65;
+    out_pos += 1;
+
+    var ep_zeros: usize = 0;
+    const EpHelper = struct {
+        fn pushByte(buf: []u8, pos: *usize, zeros: *usize, b: u8) Error!void {
+            if (zeros.* >= 2 and b <= 0x03) {
+                if (pos.* >= buf.len) return error.BufferTooSmall;
+                buf[pos.*] = 0x03;
+                pos.* += 1;
+                zeros.* = 0;
+            }
+            if (pos.* >= buf.len) return error.BufferTooSmall;
+            buf[pos.*] = b;
+            pos.* += 1;
+            if (b == 0x00) {
+                zeros.* += 1;
+            } else {
+                zeros.* = 0;
+            }
+        }
+    };
+
+    var slice_hdr_buf: [16]u8 = undefined;
+    var sh_bw = BitWriter{ .buf = &slice_hdr_buf };
+    try sh_bw.writeUe(0); // first_mb_in_slice = 0
+    try sh_bw.writeUe(7); // slice_type = 7 (I slice)
+    try sh_bw.writeUe(0); // pic_parameter_set_id = 0
+    try sh_bw.writeBits(0, 4); // frame_num = 0 (4 bits)
+    try sh_bw.writeUe(0); // idr_pic_id = 0
+    try sh_bw.writeBit(0); // no_output_of_prior_pics_flag = 0
+    try sh_bw.writeBit(0); // long_term_reference_flag = 0
+    try sh_bw.writeSe(0); // slice_qp_delta = 0
+    try sh_bw.writeUe(1); // disable_deblocking_filter_idc = 1 (disable)
+
+    // First macroblock (mb_idx == 0) mb_type = ue(25) + pcm_alignment_zero_bit
+    try sh_bw.writeUe(25); // mb_type = 25 (I_PCM in I-slice)
+    try sh_bw.alignToByteWithZeros();
+    for (sh_bw.writtenSlice()) |b| {
+        try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, b);
+    }
+
+    var mb_y: u32 = 0;
+    while (mb_y < mb_height) : (mb_y += 1) {
+        var mb_x: u32 = 0;
+        while (mb_x < mb_width) : (mb_x += 1) {
+            if (mb_y != 0 or mb_x != 0) {
+                // Byte-aligned here because previous I_PCM macroblock ended on a byte boundary.
+                // ue(25) = 000011010 (9 bits) + 7 pcm_alignment_zero_bits = 0x0D, 0x00
+                try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, 0x0D);
+                try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, 0x00);
+            }
+
+            // 256 luma samples (16x16)
+            var dy: usize = 0;
+            while (dy < 16) : (dy += 1) {
+                const py = @min(@as(usize, mb_y) * 16 + dy, h - 1);
+                var dx: usize = 0;
+                while (dx < 16) : (dx += 1) {
+                    const px = @min(@as(usize, mb_x) * 16 + dx, w - 1);
+                    const sample = y_plane[py * y_stride + px];
+                    try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, sample);
+                }
+            }
+
+            // 64 Cb (U) samples (8x8)
+            var cdy: usize = 0;
+            while (cdy < 8) : (cdy += 1) {
+                const cy = @min(@as(usize, mb_y) * 8 + cdy, uv_h - 1);
+                var cdx: usize = 0;
+                while (cdx < 8) : (cdx += 1) {
+                    const cx = @min(@as(usize, mb_x) * 8 + cdx, uv_w - 1);
+                    const sample = u_plane[cy * uv_stride + cx];
+                    try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, sample);
+                }
+            }
+
+            // 64 Cr (V) samples (8x8)
+            cdy = 0;
+            while (cdy < 8) : (cdy += 1) {
+                const cy = @min(@as(usize, mb_y) * 8 + cdy, uv_h - 1);
+                var cdx: usize = 0;
+                while (cdx < 8) : (cdx += 1) {
+                    const cx = @min(@as(usize, mb_x) * 8 + cdx, uv_w - 1);
+                    const sample = v_plane[cy * uv_stride + cx];
+                    try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, sample);
+                }
+            }
+        }
+    }
+
+    // rbsp_slice_trailing_bits at byte boundary: 1 bit followed by 7 zero bits => 0x80
+    try EpHelper.pushByte(out_buf, &out_pos, &ep_zeros, 0x80);
+
+    return out_buf[0..out_pos];
+}
+
+// ============================================================================
 // Opus RTP Packetizer & Depacketizer (RFC 7587 & RFC 6716)
 // ============================================================================
 
@@ -1352,3 +1640,60 @@ test "Opus TOC byte inspection and RTP packetization" {
     try std.testing.expectEqual(@as(u32, 960), decoded.info.samples_per_frame_48k);
     try std.testing.expectEqualSlices(u8, &frame1, decoded.payload);
 }
+
+test "encodeH264BaselineIpcmFrame + H264Packetizer / H264Depacketizer round-trip" {
+    const allocator = std.testing.allocator;
+    const width: u16 = 32;
+    const height: u16 = 16;
+    var y_plane: [32 * 16]u8 = undefined;
+    var u_plane: [16 * 8]u8 = undefined;
+    var v_plane: [16 * 8]u8 = undefined;
+
+    for (&y_plane, 0..) |*b, i| b.* = @truncate(i *% 17 +% 3);
+    for (&u_plane, 0..) |*b, i| b.* = @truncate(128 +% (i & 0x1F));
+    for (&v_plane, 0..) |*b, i| b.* = @truncate(128 -% (i & 0x1F));
+
+    var annexb_buf: [4096]u8 = undefined;
+    const encoded = try encodeH264BaselineIpcmFrame(
+        &y_plane,
+        &u_plane,
+        &v_plane,
+        width,
+        height,
+        width,
+        width / 2,
+        &annexb_buf,
+    );
+
+    const nals = try splitAnnexBNals(allocator, encoded);
+    defer allocator.free(nals);
+    try std.testing.expectEqual(@as(usize, 3), nals.len);
+    try std.testing.expectEqual(H264NalType.SPS, @as(u5, @intCast(nals[0][0] & 0x1F)));
+    try std.testing.expectEqual(@as(u8, 66), nals[0][1]); // profile_idc = 66
+    try std.testing.expectEqual(@as(u8, 31), nals[0][3]); // level_idc = 31
+    try std.testing.expectEqual(H264NalType.PPS, @as(u5, @intCast(nals[1][0] & 0x1F)));
+    try std.testing.expectEqual(H264NalType.IDR, @as(u5, @intCast(nals[2][0] & 0x1F)));
+
+    var seq = RtpSequencer{ .ssrc = 0xCAFE1234, .payload_type = 102 };
+    var packetizer = H264Packetizer{
+        .sequencer = &seq,
+        .mode = .non_interleaved,
+        .max_payload_len = 500,
+    };
+    const packets = try packetizer.packetize(allocator, encoded, 90000);
+    defer freeOwnedPackets(allocator, packets);
+    try std.testing.expect(packets.len >= 2);
+
+    var depacketizer = H264Depacketizer{};
+    defer depacketizer.deinit(allocator);
+    var reassembled: ?[]u8 = null;
+    for (packets) |pkt| {
+        if (try depacketizer.push(allocator, pkt.asPacket())) |au| {
+            reassembled = au;
+        }
+    }
+    try std.testing.expect(reassembled != null);
+    defer allocator.free(reassembled.?);
+    try std.testing.expectEqualSlices(u8, encoded, reassembled.?);
+}
+

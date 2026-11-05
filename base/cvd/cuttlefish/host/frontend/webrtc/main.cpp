@@ -16,6 +16,7 @@
 
 #include <libyuv.h>
 
+#include <cstdlib>
 #include <memory>
 #include <string_view>
 
@@ -670,7 +671,23 @@ int CuttlefishMain() {
 
 }  // namespace cuttlefish
 
+extern "C" int cf_zig_streamer_run(int argc, char** argv);
+
 int main(int argc, char** argv) {
+  if (argc > 1) {
+    bool run_zig_streamer = (std::getenv("CUTTLEFISH_CONFIG_FILE") == nullptr);
+    for (int i = 1; i < argc && !run_zig_streamer; ++i) {
+      std::string_view arg(argv[i]);
+      if (arg.starts_with("--device_id") || arg.starts_with("-device_id") ||
+          arg.starts_with("--operator_socket_path") ||
+          arg.starts_with("-operator_socket_path")) {
+        run_zig_streamer = true;
+      }
+    }
+    if (run_zig_streamer) {
+      return cf_zig_streamer_run(argc, argv);
+    }
+  }
   cuttlefish::DefaultSubprocessLogging(argv);
   rtc::LogMessage::LogToDebug(rtc::LS_WARNING);
   ::gflags::ParseCommandLineFlags(&argc, &argv, true);
