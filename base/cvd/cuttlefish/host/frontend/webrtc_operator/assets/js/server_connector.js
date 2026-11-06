@@ -56,7 +56,9 @@ async function ajaxPostJson(url, data) {
 class OperatorConnector {
   #ws = null;
   #connId = null;
+  #deviceId = null;
   #pollTimer = null;
+  #reconnectTimer = null;
   #onDeviceMsgCb = (msg) =>
     console.error('Received device message without registered listener', msg);
 
@@ -84,6 +86,7 @@ class OperatorConnector {
 
   async requestDevice(targetDeviceId) {
     const resolvedDeviceId = await this.#resolveDeviceId(targetDeviceId);
+    this.#deviceId = resolvedDeviceId;
     if (typeof document !== 'undefined' && document.title === targetDeviceId) {
       document.title = resolvedDeviceId;
     }
@@ -97,7 +100,7 @@ class OperatorConnector {
     return await this.#requestViaPolling(resolvedDeviceId);
   }
 
-  async #requestViaWebSocket(targetDeviceId) {
+  async #requestViaWebSocket(targetDeviceId, isReconnect = false) {
     return new Promise((resolve, reject) => {
       const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${wsProto}//${location.host}/connect_client`;
@@ -136,6 +139,17 @@ class OperatorConnector {
           clearTimeout(timer);
           resolved = true;
           this.#ws = ws;
+          this.#deviceId = targetDeviceId;
+          if (isReconnect) {
+            try {
+              ws.send(
+                JSON.stringify({
+                  message_type: 'forward',
+                  payload: { type: 'request-offer' },
+                })
+              );
+            } catch (_) {}
+          }
           resolve({
             deviceInfo: msg.device_info,
             infraConfig: infraConfig,
@@ -160,9 +174,21 @@ class OperatorConnector {
       };
 
       ws.onclose = () => {
+        if (this.#ws === ws) {
+          this.#ws = null;
+        }
         if (!resolved) {
           clearTimeout(timer);
           reject(new Error('WebSocket closed before device_info'));
+          return;
+        }
+        if (this.#reconnectTimer === null) {
+          this.#reconnectTimer = setTimeout(() => {
+            this.#reconnectTimer = null;
+            if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+              this.#requestViaWebSocket(targetDeviceId, true).catch(() => {});
+            }
+          }, 300);
         }
       };
     });
@@ -177,14 +203,14 @@ class OperatorConnector {
       throw new Error(res.error);
     }
     this.#connId = res.connection_id;
-    this.#startPolling();
+    this.#startPollingLoop();
     return {
       deviceInfo: res.device_info,
       infraConfig: infraConfig,
     };
   }
 
-  #startPolling() {
+  #startPollingLoop() {
     if (this.#pollTimer !== null) return;
     const pollFn = async () => {
       try {
@@ -199,9 +225,9 @@ class OperatorConnector {
       } catch (e) {
         console.warn('poll_messages error:', e);
       }
-      this.#pollTimer = setTimeout(pollFn, 500);
+      this.#pollTimer = setTimeout(pollFn, 50);
     };
-    this.#pollTimer = setTimeout(pollFn, 250);
+    this.#pollTimer = setTimeout(pollFn, 50);
   }
 
   async sendToDevice(msg) {
@@ -214,9 +240,25 @@ class OperatorConnector {
       );
       return;
     }
+    const resolvedDeviceId =
+      this.#deviceId || (await this.#resolveDeviceId(deviceId()));
+    this.#deviceId = resolvedDeviceId;
+    if (typeof WebSocket !== 'undefined') {
+      try {
+        await this.#requestViaWebSocket(resolvedDeviceId, true);
+        if (this.#ws && this.#ws.readyState === WebSocket.OPEN) {
+          this.#ws.send(
+            JSON.stringify({
+              message_type: 'forward',
+              payload: msg,
+            })
+          );
+          return;
+        }
+      } catch (_) {}
+    }
     if (this.#connId === null) {
       try {
-        const resolvedDeviceId = await this.#resolveDeviceId('cf0');
         await this.#requestViaPolling(resolvedDeviceId);
       } catch (e) {
         console.warn('Auto-reconnect polling failed:', e);

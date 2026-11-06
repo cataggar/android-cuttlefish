@@ -165,32 +165,52 @@ pub const UnixDeviceServer = struct {
 
     fn handleClientThread(self: *UnixDeviceServer, client_fd: i32) void {
         var registered_device_id: ?[]u8 = null;
+        var registered_sink: ?DeviceSink = null;
         defer {
             if (registered_device_id) |dev_id| {
-                self.registry.unregisterDevice(dev_id);
+                if (registered_sink) |sink| {
+                    self.registry.unregisterDeviceSink(dev_id, sink);
+                } else {
+                    self.registry.unregisterDevice(dev_id);
+                }
                 self.allocator.free(dev_id);
             }
             os_socket.close(client_fd);
         }
 
         switch (self.active_mode) {
-            .seqpacket => self.runSeqPacketLoop(client_fd, &registered_device_id),
-            .stream => self.runStreamLoop(client_fd, &registered_device_id),
+            .seqpacket => self.runSeqPacketLoop(client_fd, &registered_device_id, &registered_sink),
+            .stream => self.runStreamLoop(client_fd, &registered_device_id, &registered_sink),
         }
     }
 
-    fn runSeqPacketLoop(self: *UnixDeviceServer, client_fd: i32, registered_device_id: *?[]u8) void {
+    fn runSeqPacketLoop(
+        self: *UnixDeviceServer,
+        client_fd: i32,
+        registered_device_id: *?[]u8,
+        registered_sink: *?DeviceSink,
+    ) void {
         while (self.running.load(.acquire)) {
             const pkt_opt = os_socket.recvSeqPacket(self.allocator, client_fd, MAX_DEVICE_PACKET_BYTES) catch break;
             const pkt = pkt_opt orelse break;
             defer self.allocator.free(pkt);
             if (pkt.len == 0) continue;
 
-            self.processDeviceJsonMessageWithSink(.{ .unix_seqpacket_fd = client_fd }, pkt, registered_device_id);
+            self.processDeviceJsonMessageWithSink(
+                .{ .unix_seqpacket_fd = client_fd },
+                pkt,
+                registered_device_id,
+                registered_sink,
+            );
         }
     }
 
-    fn runStreamLoop(self: *UnixDeviceServer, client_fd: i32, registered_device_id: *?[]u8) void {
+    fn runStreamLoop(
+        self: *UnixDeviceServer,
+        client_fd: i32,
+        registered_device_id: *?[]u8,
+        registered_sink: *?DeviceSink,
+    ) void {
         var accum: std.ArrayList(u8) = .empty;
         defer accum.deinit(self.allocator);
 
@@ -223,6 +243,7 @@ pub const UnixDeviceServer = struct {
                         .{ .unix_stream_framed_fd = client_fd },
                         msg_copy,
                         registered_device_id,
+                        registered_sink,
                     );
                 } else if (extractNextJsonObject(accum.items)) |span| {
                     const msg_end = span.end;
@@ -239,6 +260,7 @@ pub const UnixDeviceServer = struct {
                         .{ .unix_stream_fd = client_fd },
                         msg_copy,
                         registered_device_id,
+                        registered_sink,
                     );
                 } else {
                     break;
@@ -252,6 +274,7 @@ pub const UnixDeviceServer = struct {
         sink: DeviceSink,
         raw_json: []const u8,
         registered_device_id: *?[]u8,
+        registered_sink: *?DeviceSink,
     ) void {
         var parsed = protocol.parseDeviceMessage(self.allocator, raw_json) catch {
             const err_msg = protocol.formatError(self.allocator, "Invalid device signaling message") catch return;
@@ -264,12 +287,17 @@ pub const UnixDeviceServer = struct {
         switch (parsed) {
             .register => |reg| {
                 if (registered_device_id.*) |old_id| {
-                    self.registry.unregisterDevice(old_id);
+                    if (registered_sink.*) |old_sink| {
+                        self.registry.unregisterDeviceSink(old_id, old_sink);
+                    } else {
+                        self.registry.unregisterDevice(old_id);
+                    }
                     self.allocator.free(old_id);
                     registered_device_id.* = null;
+                    registered_sink.* = null;
                 }
 
-                self.registry.registerDevice(reg.device_id, reg.device_port, reg.device_info_json, sink) catch {
+                self.registry.registerOrReplaceDevice(reg.device_id, reg.device_port, reg.device_info_json, sink) catch {
                     const err_msg = protocol.formatError(self.allocator, "Device already registered") catch return;
                     defer self.allocator.free(err_msg);
                     sink.send(err_msg) catch {};
@@ -277,6 +305,7 @@ pub const UnixDeviceServer = struct {
                 };
 
                 registered_device_id.* = self.allocator.dupe(u8, reg.device_id) catch null;
+                registered_sink.* = sink;
 
                 const cfg = protocol.formatConfig(self.allocator, self.stun_server) catch return;
                 defer self.allocator.free(cfg);

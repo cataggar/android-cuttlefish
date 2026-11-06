@@ -215,6 +215,40 @@ pub const Registry = struct {
         });
     }
 
+    pub fn registerOrReplaceDevice(
+        self: *Registry,
+        device_id: []const u8,
+        device_port: u16,
+        device_info_json: []const u8,
+        sink: DeviceSink,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.devices.items) |*dev| {
+            if (std.mem.eql(u8, dev.device_id, device_id)) {
+                const info_copy = try self.allocator.dupe(u8, device_info_json);
+                self.allocator.free(dev.device_info_json);
+                dev.device_info_json = info_copy;
+                dev.device_port = device_port;
+                dev.sink = sink;
+                return;
+            }
+        }
+
+        const id_copy = try self.allocator.dupe(u8, device_id);
+        errdefer self.allocator.free(id_copy);
+        const info_copy = try self.allocator.dupe(u8, device_info_json);
+        errdefer self.allocator.free(info_copy);
+
+        try self.devices.append(self.allocator, .{
+            .device_id = id_copy,
+            .device_port = device_port,
+            .device_info_json = info_copy,
+            .sink = sink,
+        });
+    }
+
     pub fn unregisterDevice(self: *Registry, device_id: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -222,6 +256,22 @@ pub const Registry = struct {
         var i: usize = 0;
         while (i < self.devices.items.len) : (i += 1) {
             if (std.mem.eql(u8, self.devices.items[i].device_id, device_id)) {
+                var removed = self.devices.orderedRemove(i);
+                removed.deinit(self.allocator);
+                return;
+            }
+        }
+    }
+
+    pub fn unregisterDeviceSink(self: *Registry, device_id: []const u8, sink: DeviceSink) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.devices.items.len) : (i += 1) {
+            if (std.mem.eql(u8, self.devices.items[i].device_id, device_id) and
+                std.meta.eql(self.devices.items[i].sink, sink))
+            {
                 var removed = self.devices.orderedRemove(i);
                 removed.deinit(self.allocator);
                 return;
@@ -478,6 +528,36 @@ pub const Registry = struct {
     ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        const is_broadcast = (client_id == 0) or (std.mem.indexOf(u8, payload_raw_json, "\"h264-frame\"") != null);
+        if (is_broadcast) {
+            const wrapped = try protocol.formatDeviceMsg(self.allocator, payload_raw_json);
+            defer self.allocator.free(wrapped);
+
+            for (self.clients.items) |*cli| {
+                if (device_id.len > 0 and !std.mem.eql(u8, cli.device_id, device_id)) {
+                    continue;
+                }
+                switch (cli.sink) {
+                    .websocket_fd => |fd| {
+                        sendWebSocketTextFrame(fd, wrapped) catch {};
+                    },
+                    .callback => |cb| {
+                        cb.send_fn(cb.ctx, wrapped) catch {};
+                    },
+                    .polling => |*poll_state| {
+                        if (poll_state.queue.items.len < MAX_POLL_QUEUE_LEN) {
+                            if (self.allocator.dupe(u8, wrapped)) |copy| {
+                                poll_state.queue.append(self.allocator, copy) catch {
+                                    self.allocator.free(copy);
+                                };
+                            } else |_| {}
+                        }
+                    },
+                }
+            }
+            return;
+        }
 
         for (self.clients.items) |*cli| {
             if (cli.client_id == client_id) {

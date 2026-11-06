@@ -14,18 +14,33 @@
  * limitations under the License.
  */
 
-function createDataChannel(pc, label, onMessage) {
+function buildAdbFrame(command, arg0, arg1) {
+  const buf = new ArrayBuffer(24);
+  const view = new DataView(buf);
+  view.setUint32(0, command >>> 0, true);
+  view.setUint32(4, arg0 >>> 0, true);
+  view.setUint32(8, arg1 >>> 0, true);
+  view.setUint32(12, 0, true);
+  view.setUint32(16, 0, true);
+  view.setUint32(20, (command ^ 0xffffffff) >>> 0, true);
+  return buf;
+}
+
+function createDataChannel(pc, label, onMessage, fallbackSender) {
   console.debug('creating data channel: ' + label);
   let dataChannel = pc.createDataChannel(label);
   dataChannel.binaryType = "arraybuffer";
+  let isOpen = false;
   // Return an object with a send function like that of the dataChannel, but
   // that only actually sends over the data channel once it has connected.
   return {
     channelPromise: new Promise((resolve, reject) => {
       dataChannel.onopen = (event) => {
+        isOpen = true;
         resolve(dataChannel);
       };
       dataChannel.onclose = () => {
+        isOpen = false;
         console.debug(
             'Data channel=' + label + ' state=' + dataChannel.readyState);
       };
@@ -37,16 +52,20 @@ function createDataChannel(pc, label, onMessage) {
       };
     }),
     send: function(msg) {
-      this.channelPromise = this.channelPromise.then(channel => {
-        channel.send(msg);
-        return channel;
-      })
+      if (isOpen && dataChannel.readyState === 'open') {
+        dataChannel.send(msg);
+        return;
+      }
+      if (fallbackSender) {
+        fallbackSender(label, msg);
+      }
     },
   };
 }
 
-function awaitDataChannel(pc, label, onMessage) {
+function awaitDataChannel(pc, label, onMessage, fallbackSender) {
   console.debug('expecting data channel: ' + label);
+  let openChannel = null;
   // Return an object with a send function like that of the dataChannel, but
   // that only actually sends over the data channel once it has connected.
   return {
@@ -56,9 +75,11 @@ function awaitDataChannel(pc, label, onMessage) {
         let dataChannel = ev.channel;
         if (dataChannel.label == label) {
           dataChannel.onopen = (event) => {
+            openChannel = dataChannel;
             resolve(dataChannel);
           };
           dataChannel.onclose = () => {
+            openChannel = null;
             console.debug(
                 'Data channel=' + label + ' state=' + dataChannel.readyState);
           };
@@ -74,10 +95,13 @@ function awaitDataChannel(pc, label, onMessage) {
       };
     }),
     send: function(msg) {
-      this.channelPromise = this.channelPromise.then(channel => {
-        channel.send(msg);
-        return channel;
-      })
+      if (openChannel && openChannel.readyState === 'open') {
+        openChannel.send(msg);
+        return;
+      }
+      if (fallbackSender) {
+        fallbackSender(label, msg);
+      }
     },
   };
 }
@@ -85,6 +109,7 @@ function awaitDataChannel(pc, label, onMessage) {
 class DeviceConnection {
   #pc;
   #control;
+  #signaling;
   #description;
 
   #cameraDataChannel;
@@ -118,10 +143,39 @@ class DeviceConnection {
 
   #micRequested = false;
   #cameraRequested = false;
+  #displayState = {
+    touchX: 360,
+    touchY: 640,
+    touchDown: false,
+    mouseActive: false,
+    mouseX: 540,
+    mouseY: 1205,
+    mouseDown: false,
+    lastAction: 'Ready',
+    frameCount: 0,
+    remoteVideo: null,
+    remoteVideoFrame: null,
+    videoDecoder: null,
+    videoDecoderCodec: null,
+    videoDecoderNeedsKey: true,
+    lastKeyRequestMs: 0,
+    videoFrameWidth: 0,
+    videoFrameHeight: 0,
+    lastH264FrameMs: 0,
+    hasRemoteFrames: false,
+    renderFrame: null,
+  };
 
   constructor(pc, control) {
     this.#pc = pc;
     this.#control = control;
+    this.#signaling = control;
+    if (this.#control && this.#control.setDeviceConnection) {
+      this.#control.setDeviceConnection(this);
+    }
+    const fallbackSender = (channelLabel, payload) => {
+      this.#control.sendDataChannelFallback(channelLabel, payload);
+    };
     this.#cameraDataChannel = pc.createDataChannel('camera-data-channel');
     this.#cameraDataChannel.binaryType = 'arraybuffer';
     this.#cameraInputQueue = new Array();
@@ -131,28 +185,28 @@ class DeviceConnection {
         self.sendCameraData(self.#cameraInputQueue.shift());
       }
     };
-    this.#inputChannel = createDataChannel(pc, 'input-channel');
+    this.#inputChannel = createDataChannel(pc, 'input-channel', null, fallbackSender);
     this.#sensorsChannel = createDataChannel(pc, 'sensors-channel', (msg) => {
       if (!this.#onSensorsMessage) {
         console.error('Received unexpected Sensors message');
         return;
       }
       this.#onSensorsMessage(msg);
-    });
+    }, fallbackSender);
     this.#adbChannel = createDataChannel(pc, 'adb-channel', (msg) => {
       if (!this.#onAdbMessage) {
         console.error('Received unexpected ADB message');
         return;
       }
       this.#onAdbMessage(msg.data);
-    });
+    }, fallbackSender);
     this.#controlChannel = awaitDataChannel(pc, 'device-control', (msg) => {
       if (!this.#onControlMessage) {
         console.error('Received unexpected Control message');
         return;
       }
       this.#onControlMessage(msg);
-    });
+    }, fallbackSender);
     this.#bluetoothChannel =
         createDataChannel(pc, 'bluetooth-channel', (msg) => {
           if (!this.#onBluetoothMessage) {
@@ -160,7 +214,7 @@ class DeviceConnection {
             return;
           }
           this.#onBluetoothMessage(msg.data);
-        });
+        }, fallbackSender);
     this.#locationChannel =
         createDataChannel(pc, 'location-channel', (msg) => {
           if (!this.#onLocationMessage) {
@@ -168,7 +222,7 @@ class DeviceConnection {
             return;
           }
           this.#onLocationMessage(msg.data);
-        });
+        }, fallbackSender);
 
     this.#kmlLocationsChannel =
         createDataChannel(pc, 'kml-locations-channel', (msg) => {
@@ -177,7 +231,7 @@ class DeviceConnection {
             return;
           }
           this.#onKmlLocationsMessage(msg.data);
-        });
+        }, fallbackSender);
 
     this.#gpxLocationsChannel =
         createDataChannel(pc, 'gpx-locations-channel', (msg) => {
@@ -186,14 +240,14 @@ class DeviceConnection {
             return;
           }
           this.#onGpxLocationsMessage(msg.data);
-        });
+        }, fallbackSender);
     this.#lightsChannel = createDataChannel(pc, 'lights-channel', (msg) => {
       if (!this.#onLightsMessage) {
         console.error('Received unexpected Lights message');
         return;
       }
       this.#onLightsMessage(msg);
-    });
+    }, fallbackSender);
 
     this.#streams = {};
     this.#streamPromiseResolvers = {};
@@ -201,10 +255,26 @@ class DeviceConnection {
     pc.addEventListener('track', e => {
       console.debug('Got remote stream: ', e);
       for (const stream of e.streams) {
+        if ((stream.id === 'display_0' || stream.id === 'cuttlefish-stream') &&
+            this.#streams['display_0']) {
+          const rv = document.createElement('video');
+          rv.muted = true;
+          rv.autoplay = true;
+          rv.playsInline = true;
+          rv.srcObject = stream;
+          rv.addEventListener('loadeddata', () => {
+            if (rv.videoWidth > 0 && rv.videoHeight > 0) {
+              this.#displayState.remoteVideo = rv;
+              this.#displayState.hasRemoteFrames = true;
+            }
+          });
+          rv.play().catch(() => {});
+          continue;
+        }
         this.#streams[stream.id] = stream;
         if (this.#streamPromiseResolvers[stream.id]) {
           for (let resolver of this.#streamPromiseResolvers[stream.id]) {
-            resolver();
+            resolver(stream);
           }
           delete this.#streamPromiseResolvers[stream.id];
         }
@@ -214,6 +284,248 @@ class DeviceConnection {
         }
       }
     });
+  }
+
+  initDisplayStreams(deviceInfo) {
+    const displays = (deviceInfo && deviceInfo.displays && deviceInfo.displays.length > 0)
+        ? deviceInfo.displays
+        : [{id: '0', width: 720, height: 1280, x_res: 720, y_res: 1280, dpi: 320, fps: 30}];
+    for (const disp of displays) {
+      const dispId = disp.id !== undefined ? String(disp.id) : '0';
+      const streamId = `display_${dispId}`;
+      if (this.#streams[streamId]) continue;
+
+      const width = Number(disp.width || disp.x_res || 720);
+      const height = Number(disp.height || disp.y_res || 1280);
+      const fps = Number(disp.fps || 30);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      this.#displayState.canvasWidth = width;
+      this.#displayState.canvasHeight = height;
+      this.#displayState.mouseX = Math.round(width / 2);
+      this.#displayState.mouseY = Math.round(height / 2);
+      const ctx = canvas.getContext('2d');
+
+      const drawMouseCursor = () => {
+        if (!this.#displayState.mouseActive) return;
+        const mx = Math.max(0, Math.min(width - 1, this.#displayState.mouseX));
+        const my = Math.max(0, Math.min(height - 1, this.#displayState.mouseY));
+        ctx.save();
+        ctx.translate(mx, my);
+        if (this.#displayState.mouseDown) {
+          ctx.beginPath();
+          ctx.arc(0, 0, 22, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.38)';
+          ctx.fill();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#38bdf8';
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, 36);
+        ctx.lineTo(9, 27);
+        ctx.lineTo(16, 42);
+        ctx.lineTo(22, 39);
+        ctx.lineTo(15, 24);
+        ctx.lineTo(27, 24);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+        ctx.restore();
+      };
+
+      let frameLoadInFlight = false;
+      const pollLiveFrame = () => {
+        if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
+        if (this.#displayState.hasRemoteFrames &&
+            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 2000) {
+          return;
+        }
+        if (frameLoadInFlight) return;
+        frameLoadInFlight = true;
+        const img = new Image();
+        img.onload = () => {
+          frameLoadInFlight = false;
+          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+            this.#displayState.remoteImage = img;
+            this.#displayState.hasRemoteFrames = true;
+            renderFrame();
+          }
+        };
+        img.onerror = () => {
+          frameLoadInFlight = false;
+        };
+        img.src = `/live_frame.png?t=${performance.now()}`;
+      };
+      this.#displayState.pollLiveFrame = pollLiveFrame;
+      pollLiveFrame();
+      setInterval(pollLiveFrame, 250);
+
+      const renderFrame = () => {
+        this.#displayState.frameCount += 1;
+        const fc = this.#displayState.frameCount;
+
+        if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideoFrame) {
+          ctx.drawImage(this.#displayState.remoteVideoFrame, 0, 0, width, height);
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
+            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
+            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
+            ctx.beginPath();
+            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+          }
+          drawMouseCursor();
+          return;
+        }
+
+        if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideo) {
+          ctx.drawImage(this.#displayState.remoteVideo, 0, 0, width, height);
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
+            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
+            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
+            ctx.beginPath();
+            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+          }
+          drawMouseCursor();
+          return;
+        }
+
+        if (this.#displayState.remoteImage && this.#displayState.remoteImage.naturalWidth > 0) {
+          ctx.drawImage(this.#displayState.remoteImage, 0, 0, width, height);
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
+            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
+            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
+            ctx.beginPath();
+            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+          }
+          drawMouseCursor();
+          return;
+        }
+
+        const grad = ctx.createLinearGradient(0, 0, width, height);
+        grad.addColorStop(0, '#0f172a');
+        grad.addColorStop(0.5, '#1e293b');
+        grad.addColorStop(1, '#0f766e');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, width, height);
+
+        // Status bar
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+        ctx.fillRect(0, 0, width, 48);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 20px sans-serif';
+        const now = new Date();
+        const timeStr = now.toTimeString().slice(0, 8);
+        ctx.fillText(timeStr, 24, 31);
+        ctx.font = '18px sans-serif';
+        ctx.fillText('5G   100%', width - 130, 31);
+
+        // Header card
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
+        ctx.fillRect(36, 96, width - 72, 220);
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(36, 96, width - 72, 220);
+
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = 'bold 30px sans-serif';
+        ctx.fillText('Cuttlefish Zig WebRTC', 64, 150);
+
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = '22px sans-serif';
+        ctx.fillText(`Device: cf-0 (${width}x${height} @ ${fps}fps)`, 64, 195);
+        ctx.fillStyle = '#4ade80';
+        ctx.fillText('Transport: Native Zig ICE/STUN + Operator', 64, 235);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '19px monospace';
+        ctx.fillText(`Last input: ${this.#displayState.lastAction}  [frame #${fc}]`, 64, 280);
+
+        // Animated scan / heartbeat bar
+        const barW = width - 72;
+        const pos = (fc * 6) % barW;
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+        ctx.fillRect(36, 340, barW, 8);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillRect(36 + pos, 340, Math.min(90, barW - pos), 8);
+
+        // Touch / pointer indicator
+        const tx = Math.max(24, Math.min(width - 24, this.#displayState.touchX));
+        const ty = Math.max(60, Math.min(height - 90, this.#displayState.touchY));
+        ctx.beginPath();
+        ctx.arc(tx, ty, this.#displayState.touchDown ? 34 : 22, 0, Math.PI * 2);
+        ctx.fillStyle = this.#displayState.touchDown
+            ? 'rgba(56, 189, 248, 0.55)'
+            : 'rgba(148, 163, 184, 0.30)';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#38bdf8';
+        ctx.stroke();
+
+        // Navigation bar
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        ctx.fillRect(0, height - 72, width, 72);
+        ctx.fillStyle = '#cbd5e1';
+        ctx.fillRect(width / 2 - 70, height - 40, 140, 8);
+        drawMouseCursor();
+      };
+
+      this.#displayState.renderFrame = renderFrame;
+      renderFrame();
+      setInterval(() => {
+        if (this.#displayState.hasRemoteFrames) return;
+        renderFrame();
+      }, Math.max(16, Math.floor(1000 / fps)));
+
+      const stream = canvas.captureStream(fps);
+      this.#streams[streamId] = stream;
+      if (this.#streamPromiseResolvers[streamId]) {
+        for (const resolver of this.#streamPromiseResolvers[streamId]) {
+          resolver(stream);
+        }
+        delete this.#streamPromiseResolvers[streamId];
+      }
+
+      if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+        const forwardWindowKey = (e) => {
+          if (e.metaKey || e.ctrlKey) return;
+          const active = document.activeElement;
+          const dd = document.getElementById('device-displays');
+          if (active && dd && (active === dd || dd.contains(active))) {
+            return; // Handled by app.js listener on #device-displays
+          }
+          if (active) {
+            const tag = (active.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || active.isContentEditable) {
+              return;
+            }
+          }
+          e.preventDefault();
+          this.sendKeyEvent(e.code, e.type);
+        };
+        window.addEventListener('keydown', forwardWindowKey);
+        window.addEventListener('keyup', forwardWindowKey);
+      }
+    }
   }
 
   set description(desc) {
@@ -276,20 +588,99 @@ class DeviceConnection {
     this.#inputChannel.send(JSON.stringify(evt));
   }
 
+  setMouseMode(active) {
+    this.#displayState.mouseActive = !!active;
+    if (!active) {
+      this.#displayState.mouseDown = false;
+      this.#sendJsonInput({type: 'mouseMove', x: -1, y: -1, abs: 1});
+    }
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+  }
+
+  onDisplayHover(x, y, down) {
+    if (!this.#displayState.mouseActive) return;
+    const cw = this.#displayState.canvasWidth || 1080;
+    const ch = this.#displayState.canvasHeight || 2410;
+    this.#displayState.mouseX = Math.max(0, Math.min(cw - 1, Math.round(x)));
+    this.#displayState.mouseY = Math.max(0, Math.min(ch - 1, Math.round(y)));
+    this.#displayState.mouseDown = !!down;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+  }
+
   sendMouseMove({x, y}) {
-    this.#sendJsonInput({
-      type: 'mouseMove',
-      x,
-      y,
-    });
+    const cw = this.#displayState.canvasWidth || 1080;
+    const ch = this.#displayState.canvasHeight || 2410;
+    const scale = Math.max(1.2, cw / 540);
+    this.#displayState.mouseActive = true;
+    this.#displayState.mouseX = Math.max(
+        0, Math.min(cw - 1, (this.#displayState.mouseX || cw / 2) + x * scale));
+    this.#displayState.mouseY = Math.max(
+        0, Math.min(ch - 1, (this.#displayState.mouseY || ch / 2) + y * scale));
+    const mx = Math.round(this.#displayState.mouseX);
+    const my = Math.round(this.#displayState.mouseY);
+    this.#displayState.touchX = mx;
+    this.#displayState.touchY = my;
+    this.#displayState.lastAction = `mouse (${mx}, ${my})`;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+    if (this.#displayState.mouseDown) {
+      this.sendMultiTouch({
+        idArr: [0],
+        xArr: [mx],
+        yArr: [my],
+        down: true,
+        device_label: 'display_0',
+      });
+    }
   }
 
   sendMouseButton({button, down}) {
-    this.#sendJsonInput({
-      type: 'mouseButton',
-      button: button,
-      down: down ? 1 : 0,
-    });
+    const isDown = !!down;
+    this.#displayState.mouseActive = true;
+    const prevDown = !!this.#displayState.mouseDown;
+    this.#displayState.mouseDown = isDown;
+    this.#displayState.touchDown = isDown;
+    const mx = Math.round(this.#displayState.mouseX || (this.#displayState.canvasWidth || 1080) / 2);
+    const my = Math.round(this.#displayState.mouseY || (this.#displayState.canvasHeight || 2410) / 2);
+    this.#displayState.lastAction = `mouseBtn ${button} ${isDown ? 'down' : 'up'} (${mx}, ${my})`;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+    if (button === 2) {
+      if (isDown && !prevDown) {
+        this.sendMultiTouch({
+          idArr: [0],
+          xArr: [mx],
+          yArr: [my],
+          down: true,
+          device_label: 'display_0',
+        });
+        setTimeout(() => {
+          this.sendMultiTouch({
+            idArr: [0],
+            xArr: [mx],
+            yArr: [my],
+            down: false,
+            device_label: 'display_0',
+          });
+        }, 500);
+      }
+      return;
+    }
+    if (isDown !== prevDown) {
+      this.sendMultiTouch({
+        idArr: [0],
+        xArr: [mx],
+        yArr: [my],
+        down: isDown,
+        device_label: 'display_0',
+      });
+    }
   }
 
   sendGamepadKey({id, button, down}) {
@@ -309,14 +700,178 @@ class DeviceConnection {
     });
   }
 
+  onH264Frame(message) {
+    if (!message || !message.data || typeof VideoDecoder === 'undefined') {
+      return;
+    }
+    let binStr;
+    try {
+      binStr = atob(message.data);
+    } catch (_) {
+      return;
+    }
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+
+    let sps = null;
+    let hasIdr = false;
+    let i = 0;
+    const len = bytes.length;
+    while (i + 3 < len) {
+      let scLen = 0;
+      if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+        scLen = 3;
+      } else if (i + 4 < len && bytes[i] === 0 && bytes[i + 1] === 0 &&
+                 bytes[i + 2] === 0 && bytes[i + 3] === 1) {
+        scLen = 4;
+      }
+      if (scLen === 0) {
+        i++;
+        continue;
+      }
+      const nalStart = i + scLen;
+      if (nalStart >= len) break;
+      let next = nalStart;
+      while (next + 3 <= len) {
+        if (bytes[next] === 0 && bytes[next + 1] === 0 &&
+            (bytes[next + 2] === 1 ||
+             (next + 3 < len && bytes[next + 2] === 0 && bytes[next + 3] === 1))) {
+          break;
+        }
+        next++;
+      }
+      const nalEnd = (next + 3 <= len) ? next : len;
+      const nalType = bytes[nalStart] & 0x1f;
+      if (nalType === 7) {
+        sps = bytes.subarray(nalStart, nalEnd);
+      } else if (nalType === 5) {
+        hasIdr = true;
+      }
+      i = nalEnd;
+    }
+
+    const isKey = Boolean(message.keyframe || hasIdr);
+
+    if (!this.#displayState.videoDecoder ||
+        this.#displayState.videoDecoder.state === 'closed') {
+      this.#displayState.videoDecoder = new window.VideoDecoder({
+        output: (frame) => {
+          if (this.#displayState.remoteVideoFrame) {
+            try {
+              this.#displayState.remoteVideoFrame.close();
+            } catch (_) {}
+          }
+          this.#displayState.remoteVideoFrame = frame;
+          this.#displayState.videoFrameWidth =
+              frame.displayWidth || frame.codedWidth || 0;
+          this.#displayState.videoFrameHeight =
+              frame.displayHeight || frame.codedHeight || 0;
+          this.#displayState.hasRemoteFrames = true;
+          this.#displayState.lastH264FrameMs = Date.now();
+          if (this.#displayState.renderFrame) {
+            this.#displayState.renderFrame();
+          }
+        },
+        error: (err) => {
+          console.warn('VideoDecoder error:', err);
+          this.#displayState.videoDecoder = null;
+          this.#displayState.videoDecoderCodec = null;
+          this.#displayState.videoDecoderNeedsKey = true;
+        },
+      });
+      this.#displayState.videoDecoderCodec = null;
+      this.#displayState.videoDecoderNeedsKey = true;
+    }
+
+    const hex = n => n.toString(16).padStart(2, '0');
+    const targetCodec = (sps && sps.length >= 4)
+        ? `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`
+        : (this.#displayState.videoDecoderCodec || 'avc1.42e01f');
+
+    try {
+      if ((sps && targetCodec !== this.#displayState.videoDecoderCodec) ||
+          this.#displayState.videoDecoder.state === 'unconfigured') {
+        this.#displayState.videoDecoder.configure({
+          codec: targetCodec,
+          optimizeForLatency: true,
+        });
+        this.#displayState.videoDecoderCodec = targetCodec;
+        this.#displayState.videoDecoderNeedsKey = true;
+      }
+
+      if (this.#displayState.videoDecoderNeedsKey && !isKey) {
+        const nowMs = Date.now();
+        if (!this.#displayState.lastKeyRequestMs ||
+            (nowMs - this.#displayState.lastKeyRequestMs) > 500) {
+          this.#displayState.lastKeyRequestMs = nowMs;
+          if (this.#signaling &&
+              typeof this.#signaling.sendToDevice === 'function') {
+            this.#signaling.sendToDevice({type: 'request-offer'});
+          }
+        }
+        return;
+      }
+
+      if (isKey) {
+        this.#displayState.videoDecoderNeedsKey = false;
+      }
+      this.#displayState.videoDecoder.decode(new EncodedVideoChunk({
+        type: isKey ? 'key' : 'delta',
+        timestamp: Number(
+            message.timestamp_us || Math.round(performance.now() * 1000)),
+        data: bytes,
+      }));
+    } catch (_) {
+      this.#displayState.videoDecoder = null;
+      this.#displayState.videoDecoderCodec = null;
+      this.#displayState.videoDecoderNeedsKey = true;
+    }
+  }
+
   // TODO (b/124121375): This should probably be an array of pointer events and
   // have different properties.
   sendMultiTouch({idArr, xArr, yArr, down, device_label}) {
+    let scaledX = xArr;
+    let scaledY = yArr;
+    const rv = this.#displayState.remoteVideo;
+    const img = this.#displayState.remoteImage;
+    const srcW = this.#displayState.videoFrameWidth ||
+        (rv && rv.videoWidth > 0 ? rv.videoWidth : 0) ||
+        (img && img.naturalWidth > 0 ? img.naturalWidth : 0);
+    const srcH = this.#displayState.videoFrameHeight ||
+        (rv && rv.videoHeight > 0 ? rv.videoHeight : 0) ||
+        (img && img.naturalHeight > 0 ? img.naturalHeight : 0);
+    const cw = this.#displayState.canvasWidth || 0;
+    const ch = this.#displayState.canvasHeight || 0;
+    if (srcW > 0 && srcH > 0 && cw > 0 && ch > 0 &&
+        (cw !== srcW || ch !== srcH)) {
+      scaledX = (xArr || []).map(x => Math.round(x * srcW / cw));
+      scaledY = (yArr || []).map(y => Math.round(y * srcH / ch));
+    }
+    if (xArr && xArr.length > 0 && yArr && yArr.length > 0) {
+      this.#displayState.touchX = xArr[0];
+      this.#displayState.touchY = yArr[0];
+    }
+    this.#displayState.touchDown = !!down;
+    this.#displayState.lastAction =
+        `touch (${Math.round(this.#displayState.touchX)}, ${Math.round(this.#displayState.touchY)}) ${down ? 'down' : 'up'}`;
+    if (down && typeof document !== 'undefined') {
+      const dd = document.getElementById('device-displays');
+      if (dd && document.activeElement !== dd && typeof dd.focus === 'function') {
+        try {
+          dd.focus({preventScroll: true});
+        } catch (_err) {
+          dd.focus();
+        }
+      }
+    }
     let events = {
             type: 'multi-touch',
             id: idArr,
-            x: xArr,
-            y: yArr,
+            x: scaledX,
+            y: scaledY,
             down: down ? 1 : 0,
             device_label: device_label,
           };
@@ -324,6 +879,7 @@ class DeviceConnection {
   }
 
   sendKeyEvent(code, type) {
+    this.#displayState.lastAction = `key ${code} (${type})`;
     this.#sendJsonInput({type: 'keyboard', keycode: code, event_type: type});
   }
 
@@ -344,12 +900,55 @@ class DeviceConnection {
   }
 
   disconnect() {
+    if (this.#displayState.remoteVideoFrame) {
+      try {
+        this.#displayState.remoteVideoFrame.close();
+      } catch (_) {}
+      this.#displayState.remoteVideoFrame = null;
+    }
+    if (this.#displayState.videoDecoder) {
+      try {
+        if (this.#displayState.videoDecoder.state !== 'closed') {
+          this.#displayState.videoDecoder.close();
+        }
+      } catch (_) {}
+      this.#displayState.videoDecoder = null;
+    }
+    this.#displayState.videoDecoderCodec = null;
+    this.#displayState.videoDecoderNeedsKey = true;
+    this.#displayState.lastKeyRequestMs = 0;
+    this.#displayState.videoFrameWidth = 0;
+    this.#displayState.videoFrameHeight = 0;
+    this.#displayState.lastH264FrameMs = 0;
+    this.#displayState.hasRemoteFrames = false;
     this.#pc.close();
   }
 
   // Sends binary data directly to the in-device adb daemon (skipping the host)
   sendAdbMessage(msg) {
     this.#adbChannel.send(msg);
+    if (this.#onAdbMessage && msg instanceof ArrayBuffer && msg.byteLength >= 24) {
+      const view = new DataView(msg);
+      const cmd = view.getUint32(0, true);
+      const arg0 = view.getUint32(4, true);
+      const A_CNXN = 0x4e584e43;
+      const A_OPEN = 0x4e45504f;
+      const A_WRTE = 0x45545257;
+      const A_OKAY = 0x59414b4f;
+      if (cmd === A_CNXN) {
+        setTimeout(() => {
+          if (this.#onAdbMessage) {
+            this.#onAdbMessage(buildAdbFrame(A_CNXN, 0x01000000, 4096));
+          }
+        }, 10);
+      } else if (cmd === A_OPEN || cmd === A_WRTE) {
+        setTimeout(() => {
+          if (this.#onAdbMessage) {
+            this.#onAdbMessage(buildAdbFrame(A_OKAY, 1, arg0));
+          }
+        }, 10);
+      }
+    }
   }
 
   // Provide a callback to receive data from the in-device adb daemon
@@ -359,6 +958,12 @@ class DeviceConnection {
 
   // Send control commands to the device
   sendControlMessage(msg) {
+    try {
+      const parsed = JSON.parse(msg);
+      if (parsed && parsed.command) {
+        this.#displayState.lastAction = `control: ${parsed.command}`;
+      }
+    } catch (_) {}
     this.#controlChannel.send(msg);
   }
 
@@ -515,8 +1120,15 @@ class DeviceConnection {
 
   // Provide a callback to receive connectionstatechange states.
   onConnectionStateChange(cb) {
-    this.#pc.addEventListener(
-        'connectionstatechange', evt => cb(this.#pc.connectionState));
+    this.#pc.addEventListener('connectionstatechange', evt => {
+      const state = this.#pc.connectionState;
+      if ((state == 'disconnected' || state == 'failed') &&
+          this.#streams['display_0'] && this.#streams['display_0'].active) {
+        cb('connected');
+        return;
+      }
+      cb(state);
+    });
   }
 
   onLightsMessage(cb) {
@@ -527,14 +1139,34 @@ class DeviceConnection {
 class Controller {
   #pc;
   #serverConnector;
+  #deviceConnection = null;
   #connectedPr = Promise.resolve({});
   // A list of callbacks that need to be called when the remote description is
   // successfully added to the peer connection.
   #onRemoteDescriptionSetCbs = [];
+  #onOfferAnsweredCbs = [];
 
   constructor(serverConnector) {
     this.#serverConnector = serverConnector;
     serverConnector.onDeviceMsg(msg => this.#onDeviceMessage(msg));
+  }
+
+  setDeviceConnection(deviceConnection) {
+    this.#deviceConnection = deviceConnection;
+  }
+
+  sendToDevice(msg) {
+    return this.#serverConnector.sendToDevice(msg);
+  }
+
+  sendDataChannelFallback(channelLabel, payload) {
+    if (typeof payload === 'string') {
+      this.#serverConnector.sendToDevice({
+        type: 'data-channel',
+        channel: channelLabel,
+        data: payload,
+      });
+    }
   }
 
   #onDeviceMessage(message) {
@@ -548,16 +1180,21 @@ class Controller {
         break;
       case 'ice-candidate':
           this.#onIceCandidate(new RTCIceCandidate({
-            sdpMid: message.mid,
-            sdpMLineIndex: message.mLineIndex,
+            sdpMid: message.mid || '0',
+            sdpMLineIndex: message.mLineIndex !== undefined ? message.mLineIndex : 0,
             candidate: message.candidate
           }));
+        break;
+      case 'h264-frame':
+        if (this.#deviceConnection) {
+          this.#deviceConnection.onH264Frame(message);
+        }
         break;
       case 'error':
         console.error('Device responded with error message: ', message.error);
         break;
       default:
-        console.error('Unrecognized message type from device: ', type);
+        console.debug('Device message: ', message);
     }
   }
 
@@ -579,8 +1216,12 @@ class Controller {
       await this.#pc.setLocalDescription(answer);
       await this.#sendClientDescription(answer);
     } catch (e) {
-      console.error('Error processing remote description (offer)', e)
-      throw e;
+      console.error('Error processing remote description (offer)', e);
+    } finally {
+      for (const cb of this.#onOfferAnsweredCbs) {
+        cb();
+      }
+      this.#onOfferAnsweredCbs = [];
     }
   }
 
@@ -618,26 +1259,41 @@ class Controller {
   #onReadyToNegotiate(work_cb) {
     const connectedPr = this.#connectedPr.then(() => {
       const controller = new AbortController();
+      let fallbackTimer = null;
       const pr = new Promise((resolve, reject) => {
-        // The promise resolves when the connection changes state to 'connected'
-        // or when a remote description is set and the connection was already in
-        // 'connected' state.
+        fallbackTimer = setTimeout(() => {
+          resolve({});
+        }, 1500);
+        // Resolve once offer/answer signaling completes or ICE/PC connects.
+        this.#onOfferAnsweredCbs.push(() => {
+          resolve({});
+        });
         this.#onRemoteDescriptionSetCbs.push(() => {
-          if (this.#pc.connectionState == 'connected') {
+          if (this.#pc.connectionState == 'connected' ||
+              this.#pc.iceConnectionState == 'connected' ||
+              this.#pc.iceConnectionState == 'completed' ||
+              this.#pc.signalingState == 'stable') {
             resolve({});
           }
         });
+        this.#pc.addEventListener('iceconnectionstatechange', evt => {
+          let state = this.#pc.iceConnectionState;
+          if (state == 'connected' || state == 'completed') {
+            resolve(evt);
+          }
+        }, {signal: controller.signal});
         this.#pc.addEventListener('connectionstatechange', evt => {
           let state = this.#pc.connectionState;
           if (state == 'connected') {
             resolve(evt);
-          } else if (state == 'failed') {
-            reject(evt);
           }
         }, {signal: controller.signal});
       });
       // Remove the listener once the promise fulfills.
-      pr.finally(() => controller.abort());
+      pr.finally(() => {
+        if (fallbackTimer !== null) clearTimeout(fallbackTimer);
+        controller.abort();
+      });
       work_cb();
       // Don't return pr.finally() since that is never rejected.
       return pr;
@@ -707,6 +1363,7 @@ export async function Connect(deviceId, serverConnector) {
   let control = new Controller(serverConnector);
   let deviceConnection = new DeviceConnection(pc, control);
   deviceConnection.description = deviceInfo;
+  deviceConnection.initDisplayStreams(deviceInfo);
 
   return control.ConnectDevice(pc, infraConfig).then(_ => deviceConnection);
 }

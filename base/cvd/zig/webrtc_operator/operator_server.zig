@@ -491,9 +491,10 @@ pub const OperatorServer = struct {
 
     fn runDeviceWebSocketLoop(self: *OperatorServer, client_fd: i32, reader: *BufferedConnReader) void {
         var registered_device_id: ?[]u8 = null;
+        const sink: DeviceSink = .{ .websocket_fd = client_fd };
         defer {
             if (registered_device_id) |dev_id| {
-                self.registry.unregisterDevice(dev_id);
+                self.registry.unregisterDeviceSink(dev_id, sink);
                 self.allocator.free(dev_id);
             }
         }
@@ -559,12 +560,12 @@ pub const OperatorServer = struct {
         switch (parsed) {
             .register => |reg| {
                 if (registered_device_id.*) |old_id| {
-                    self.registry.unregisterDevice(old_id);
+                    self.registry.unregisterDeviceSink(old_id, sink);
                     self.allocator.free(old_id);
                     registered_device_id.* = null;
                 }
 
-                self.registry.registerDevice(reg.device_id, reg.device_port, reg.device_info_json, sink) catch {
+                self.registry.registerOrReplaceDevice(reg.device_id, reg.device_port, reg.device_info_json, sink) catch {
                     const err_msg = protocol.formatError(self.allocator, "Device already registered") catch return;
                     defer self.allocator.free(err_msg);
                     sink.send(err_msg) catch {};

@@ -109,6 +109,7 @@ function awaitDataChannel(pc, label, onMessage, fallbackSender) {
 class DeviceConnection {
   #pc;
   #control;
+  #signaling;
   #description;
 
   #cameraDataChannel;
@@ -156,6 +157,8 @@ class DeviceConnection {
     remoteVideoFrame: null,
     videoDecoder: null,
     videoDecoderCodec: null,
+    videoDecoderNeedsKey: true,
+    lastKeyRequestMs: 0,
     videoFrameWidth: 0,
     videoFrameHeight: 0,
     lastH264FrameMs: 0,
@@ -166,6 +169,7 @@ class DeviceConnection {
   constructor(pc, control) {
     this.#pc = pc;
     this.#control = control;
+    this.#signaling = control;
     if (this.#control && this.#control.setDeviceConnection) {
       this.#control.setDeviceConnection(this);
     }
@@ -339,8 +343,8 @@ class DeviceConnection {
       let frameLoadInFlight = false;
       const pollLiveFrame = () => {
         if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
-        if (this.#displayState.lastH264FrameMs &&
-            (performance.now() - this.#displayState.lastH264FrameMs) < 1500) {
+        if (this.#displayState.hasRemoteFrames &&
+            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 2000) {
           return;
         }
         if (frameLoadInFlight) return;
@@ -361,7 +365,7 @@ class DeviceConnection {
       };
       this.#displayState.pollLiveFrame = pollLiveFrame;
       pollLiveFrame();
-      setInterval(pollLiveFrame, 45);
+      setInterval(pollLiveFrame, 250);
 
       const renderFrame = () => {
         this.#displayState.frameCount += 1;
@@ -487,7 +491,10 @@ class DeviceConnection {
 
       this.#displayState.renderFrame = renderFrame;
       renderFrame();
-      setInterval(renderFrame, Math.max(16, Math.floor(1000 / fps)));
+      setInterval(() => {
+        if (this.#displayState.hasRemoteFrames) return;
+        renderFrame();
+      }, Math.max(16, Math.floor(1000 / fps)));
 
       const stream = canvas.captureStream(fps);
       this.#streams[streamId] = stream;
@@ -745,9 +752,11 @@ class DeviceConnection {
       i = nalEnd;
     }
 
+    const isKey = Boolean(message.keyframe || hasIdr);
+
     if (!this.#displayState.videoDecoder ||
         this.#displayState.videoDecoder.state === 'closed') {
-      this.#displayState.videoDecoder = new VideoDecoder({
+      this.#displayState.videoDecoder = new window.VideoDecoder({
         output: (frame) => {
           if (this.#displayState.remoteVideoFrame) {
             try {
@@ -760,57 +769,64 @@ class DeviceConnection {
           this.#displayState.videoFrameHeight =
               frame.displayHeight || frame.codedHeight || 0;
           this.#displayState.hasRemoteFrames = true;
-          this.#displayState.lastH264FrameMs = performance.now();
+          this.#displayState.lastH264FrameMs = Date.now();
           if (this.#displayState.renderFrame) {
             this.#displayState.renderFrame();
           }
         },
-        error: (e) => {
-          console.warn('VideoDecoder error:', e);
+        error: (err) => {
+          console.warn('VideoDecoder error:', err);
+          this.#displayState.videoDecoder = null;
+          this.#displayState.videoDecoderCodec = null;
+          this.#displayState.videoDecoderNeedsKey = true;
         },
       });
       this.#displayState.videoDecoderCodec = null;
+      this.#displayState.videoDecoderNeedsKey = true;
     }
 
-    if (sps && sps.length >= 4) {
-      const hex = n => n.toString(16).padStart(2, '0');
-      const codec = `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`;
-      if (this.#displayState.videoDecoder.state === 'unconfigured' ||
-          this.#displayState.videoDecoderCodec !== codec) {
-        try {
-          this.#displayState.videoDecoder.configure({
-            codec,
-            optimizeForLatency: true,
-          });
-          this.#displayState.videoDecoderCodec = codec;
-        } catch (e) {
-          console.warn('VideoDecoder configure error:', e);
-          return;
-        }
-      }
-    } else if (this.#displayState.videoDecoder.state === 'unconfigured') {
-      try {
-        const codec = 'avc1.42e01f';
+    const hex = n => n.toString(16).padStart(2, '0');
+    const targetCodec = (sps && sps.length >= 4)
+        ? `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`
+        : (this.#displayState.videoDecoderCodec || 'avc1.42e01f');
+
+    try {
+      if ((sps && targetCodec !== this.#displayState.videoDecoderCodec) ||
+          this.#displayState.videoDecoder.state === 'unconfigured') {
         this.#displayState.videoDecoder.configure({
-          codec,
+          codec: targetCodec,
           optimizeForLatency: true,
         });
-        this.#displayState.videoDecoderCodec = codec;
-      } catch (_) {
+        this.#displayState.videoDecoderCodec = targetCodec;
+        this.#displayState.videoDecoderNeedsKey = true;
+      }
+
+      if (this.#displayState.videoDecoderNeedsKey && !isKey) {
+        const nowMs = Date.now();
+        if (!this.#displayState.lastKeyRequestMs ||
+            (nowMs - this.#displayState.lastKeyRequestMs) > 500) {
+          this.#displayState.lastKeyRequestMs = nowMs;
+          if (this.#signaling &&
+              typeof this.#signaling.sendToDevice === 'function') {
+            this.#signaling.sendToDevice({type: 'request-offer'});
+          }
+        }
         return;
       }
-    }
 
-    if (this.#displayState.videoDecoder.state === 'configured') {
-      try {
-        this.#displayState.videoDecoder.decode(new EncodedVideoChunk({
-          type: (message.keyframe || hasIdr) ? 'key' : 'delta',
-          timestamp: Number(message.timestamp_us || Math.round(performance.now() * 1000)),
-          data: bytes,
-        }));
-      } catch (e) {
-        console.warn('VideoDecoder decode error:', e);
+      if (isKey) {
+        this.#displayState.videoDecoderNeedsKey = false;
       }
+      this.#displayState.videoDecoder.decode(new EncodedVideoChunk({
+        type: isKey ? 'key' : 'delta',
+        timestamp: Number(
+            message.timestamp_us || Math.round(performance.now() * 1000)),
+        data: bytes,
+      }));
+    } catch (_) {
+      this.#displayState.videoDecoder = null;
+      this.#displayState.videoDecoderCodec = null;
+      this.#displayState.videoDecoderNeedsKey = true;
     }
   }
 
@@ -860,19 +876,11 @@ class DeviceConnection {
             device_label: device_label,
           };
     this.#sendJsonInput(events);
-    if (!down && this.#displayState.pollLiveFrame) {
-      setTimeout(this.#displayState.pollLiveFrame, 25);
-      setTimeout(this.#displayState.pollLiveFrame, 60);
-    }
   }
 
   sendKeyEvent(code, type) {
     this.#displayState.lastAction = `key ${code} (${type})`;
     this.#sendJsonInput({type: 'keyboard', keycode: code, event_type: type});
-    if (this.#displayState.pollLiveFrame) {
-      setTimeout(this.#displayState.pollLiveFrame, 25);
-      setTimeout(this.#displayState.pollLiveFrame, 60);
-    }
   }
 
   sendWheelEvent(pixels) {
@@ -907,6 +915,8 @@ class DeviceConnection {
       this.#displayState.videoDecoder = null;
     }
     this.#displayState.videoDecoderCodec = null;
+    this.#displayState.videoDecoderNeedsKey = true;
+    this.#displayState.lastKeyRequestMs = 0;
     this.#displayState.videoFrameWidth = 0;
     this.#displayState.videoFrameHeight = 0;
     this.#displayState.lastH264FrameMs = 0;
@@ -1143,6 +1153,10 @@ class Controller {
 
   setDeviceConnection(deviceConnection) {
     this.#deviceConnection = deviceConnection;
+  }
+
+  sendToDevice(msg) {
+    return this.#serverConnector.sendToDevice(msg);
   }
 
   sendDataChannelFallback(channelLabel, payload) {

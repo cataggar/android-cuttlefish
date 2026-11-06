@@ -722,3 +722,126 @@ test "live loopback unix_device_server (SOCK_SEQPACKET) and operator_server (HTT
     defer allocator.free(traversal_resp);
     try std.testing.expect(std.mem.startsWith(u8, traversal_resp, "HTTP/1.1 403 Forbidden\r\n"));
 }
+
+test "registry.zig registerOrReplaceDevice and unregisterDeviceSink race protection" {
+    const allocator = std.testing.allocator;
+
+    const SinkCapture = struct {
+        allocator: Allocator,
+        messages: std.ArrayList([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.messages.items) |m| self.allocator.free(m);
+            self.messages.deinit(self.allocator);
+        }
+
+        fn send(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const copy = try self.allocator.dupe(u8, data);
+            try self.messages.append(self.allocator, copy);
+        }
+    };
+
+    var old_dev_capture = SinkCapture{ .allocator = allocator };
+    defer old_dev_capture.deinit();
+
+    var new_dev_capture = SinkCapture{ .allocator = allocator };
+    defer new_dev_capture.deinit();
+
+    const old_sink: registry.DeviceSink = .{
+        .callback = .{ .ctx = &old_dev_capture, .send_fn = SinkCapture.send },
+    };
+    const new_sink: registry.DeviceSink = .{
+        .callback = .{ .ctx = &new_dev_capture, .send_fn = SinkCapture.send },
+    };
+
+    var reg = registry.Registry.init(allocator);
+    defer reg.deinit();
+
+    try reg.registerOrReplaceDevice("cvd-1", 8443, "{\"version\":1}", old_sink);
+    try reg.registerOrReplaceDevice("cvd-1", 8444, "{\"version\":2}", new_sink);
+
+    // Old sink cleanup defer must NOT remove the replaced device
+    reg.unregisterDeviceSink("cvd-1", old_sink);
+
+    const info_after_old = (try reg.getDeviceInfoJson(allocator, "cvd-1")).?;
+    defer allocator.free(info_after_old);
+    try std.testing.expectEqualStrings("{\"version\":2}", info_after_old);
+
+    var cli_capture = SinkCapture{ .allocator = allocator };
+    defer cli_capture.deinit();
+    const cli = try reg.connectCallbackClient(allocator, "cvd-1", .{
+        .ctx = &cli_capture,
+        .send_fn = SinkCapture.send,
+    });
+    defer allocator.free(cli.device_info_json);
+
+    try reg.forwardClientToDevice(cli.client_id, "{\"type\":\"request-offer\"}");
+    try std.testing.expectEqual(@as(usize, 0), old_dev_capture.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), new_dev_capture.messages.items.len);
+
+    // New sink cleanup removes the device
+    reg.unregisterDeviceSink("cvd-1", new_sink);
+    try std.testing.expect((try reg.getDeviceInfoJson(allocator, "cvd-1")) == null);
+}
+
+test "registry.zig forwardDeviceToClient broadcasts h264-frame to all device clients" {
+    const allocator = std.testing.allocator;
+
+    const SinkCapture = struct {
+        allocator: Allocator,
+        messages: std.ArrayList([]u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.messages.items) |m| self.allocator.free(m);
+            self.messages.deinit(self.allocator);
+        }
+
+        fn send(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const copy = try self.allocator.dupe(u8, data);
+            try self.messages.append(self.allocator, copy);
+        }
+    };
+
+    var dev_capture = SinkCapture{ .allocator = allocator };
+    defer dev_capture.deinit();
+
+    var cli1_capture = SinkCapture{ .allocator = allocator };
+    defer cli1_capture.deinit();
+
+    var cli2_capture = SinkCapture{ .allocator = allocator };
+    defer cli2_capture.deinit();
+
+    var reg = registry.Registry.init(allocator);
+    defer reg.deinit();
+
+    try reg.registerOrReplaceDevice("cvd-1", 8443, "{\"displays\":[]}", .{
+        .callback = .{ .ctx = &dev_capture, .send_fn = SinkCapture.send },
+    });
+
+    const cli1 = try reg.connectCallbackClient(allocator, "cvd-1", .{
+        .ctx = &cli1_capture,
+        .send_fn = SinkCapture.send,
+    });
+    defer allocator.free(cli1.device_info_json);
+
+    const cli2 = try reg.connectCallbackClient(allocator, "cvd-1", .{
+        .ctx = &cli2_capture,
+        .send_fn = SinkCapture.send,
+    });
+    defer allocator.free(cli2.device_info_json);
+
+    // Even with a stale/different client_id (e.g., 99), h264-frame is broadcast to all clients for cvd-1
+    try reg.forwardDeviceToClient(
+        "cvd-1",
+        99,
+        "{\"type\":\"h264-frame\",\"keyframe\":true,\"data\":\"AAAA\"}",
+    );
+
+    const expected = "{\"message_type\":\"device_msg\",\"payload\":{\"type\":\"h264-frame\",\"keyframe\":true,\"data\":\"AAAA\"}}";
+    try std.testing.expectEqual(@as(usize, 1), cli1_capture.messages.items.len);
+    try std.testing.expectEqualStrings(expected, cli1_capture.messages.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), cli2_capture.messages.items.len);
+    try std.testing.expectEqualStrings(expected, cli2_capture.messages.items[0]);
+}
