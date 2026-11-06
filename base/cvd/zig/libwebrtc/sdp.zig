@@ -377,6 +377,11 @@ pub const ParsedSdp = struct {
                 }
 
                 for (sec.ssrcs) |ssrc_attr| {
+                    if (ssrc_attr.msid.len > 0) {
+                        try out.appendSlice(allocator, "a=msid:");
+                        try out.appendSlice(allocator, ssrc_attr.msid);
+                        try out.appendSlice(allocator, "\r\n");
+                    }
                     if (ssrc_attr.cname.len > 0) {
                         const cname_prefix = try std.fmt.bufPrint(&line_buf, "a=ssrc:{d} cname:", .{ssrc_attr.ssrc});
                         try out.appendSlice(allocator, cname_prefix);
@@ -885,7 +890,7 @@ pub const OfferAnswerOptions = struct {
     include_video: bool = true,
     include_audio: bool = true,
     include_datachannel: bool = true,
-    video_ssrc: u32 = 0x11223344,
+    video_ssrc: u32 = 0x22334455,
     audio_ssrc: u32 = 0x55667788,
     candidates: []const []const u8 = &.{},
 };
@@ -948,7 +953,7 @@ pub fn buildOfferSdp(allocator: std.mem.Allocator, opts: OfferAnswerOptions) ![]
     const video_ssrcs = [_]SsrcAttribute{.{
         .ssrc = opts.video_ssrc,
         .cname = "cuttlefish-video",
-        .msid = "cuttlefish-stream display_0",
+        .msid = "display_0 display_0",
     }};
 
     const audio_ssrcs = [_]SsrcAttribute{.{
@@ -1066,7 +1071,7 @@ pub fn negotiateAnswerSdp(
     const video_ssrcs = [_]SsrcAttribute{.{
         .ssrc = opts.video_ssrc,
         .cname = "cuttlefish-video",
-        .msid = "cuttlefish-stream display_0",
+        .msid = "display_0 display_0",
     }};
 
     const audio_ssrcs = [_]SsrcAttribute{.{
@@ -1316,6 +1321,9 @@ test "buildOfferSdp and parseSdp round-trip serialization" {
     try std.testing.expectEqual(@as(usize, 1), video_sec.ssrcs.len);
     try std.testing.expectEqual(@as(u32, 0x12345678), video_sec.ssrcs[0].ssrc);
     try std.testing.expectEqualStrings("cuttlefish-video", video_sec.ssrcs[0].cname);
+    try std.testing.expectEqualStrings("display_0 display_0", video_sec.ssrcs[0].msid);
+    try std.testing.expect(std.mem.indexOf(u8, offer_sdp, "a=msid:display_0 display_0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, offer_sdp, "a=ssrc:305419896 msid:display_0 display_0\r\n") != null);
     try std.testing.expectEqual(@as(usize, 1), video_sec.candidates.len);
     try std.testing.expectEqualStrings(candidates[0], video_sec.candidates[0]);
 
@@ -1414,6 +1422,10 @@ test "negotiateAnswerSdp against browser JSEP offer with session-level attribute
     try std.testing.expectEqual(@as(u8, 102), v_sec.codecs[1].payload_type);
     try std.testing.expectEqualStrings("H264", v_sec.codecs[1].name);
     try std.testing.expectEqual(@as(?u8, 1), v_sec.codecs[1].h264PacketizationMode());
+    try std.testing.expectEqual(@as(usize, 1), v_sec.ssrcs.len);
+    try std.testing.expectEqual(@as(u32, 0x22334455), v_sec.ssrcs[0].ssrc);
+    try std.testing.expectEqualStrings("display_0 display_0", v_sec.ssrcs[0].msid);
+    try std.testing.expect(std.mem.indexOf(u8, answer_sdp, "a=msid:display_0 display_0\r\n") != null);
     try std.testing.expect(!ans.hasCodec(.video, "VP9"));
 
     // Audio section: PCMU filtered out; opus (111) kept; remote sendonly -> local recvonly

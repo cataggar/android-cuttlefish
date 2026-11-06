@@ -153,6 +153,12 @@ class DeviceConnection {
     lastAction: 'Ready',
     frameCount: 0,
     remoteVideo: null,
+    remoteVideoFrame: null,
+    videoDecoder: null,
+    videoDecoderCodec: null,
+    videoFrameWidth: 0,
+    videoFrameHeight: 0,
+    lastH264FrameMs: 0,
     hasRemoteFrames: false,
     renderFrame: null,
   };
@@ -160,6 +166,9 @@ class DeviceConnection {
   constructor(pc, control) {
     this.#pc = pc;
     this.#control = control;
+    if (this.#control && this.#control.setDeviceConnection) {
+      this.#control.setDeviceConnection(this);
+    }
     const fallbackSender = (channelLabel, payload) => {
       this.#control.sendDataChannelFallback(channelLabel, payload);
     };
@@ -242,7 +251,8 @@ class DeviceConnection {
     pc.addEventListener('track', e => {
       console.debug('Got remote stream: ', e);
       for (const stream of e.streams) {
-        if (stream.id === 'display_0' && this.#streams['display_0']) {
+        if ((stream.id === 'display_0' || stream.id === 'cuttlefish-stream') &&
+            this.#streams['display_0']) {
           const rv = document.createElement('video');
           rv.muted = true;
           rv.autoplay = true;
@@ -328,6 +338,11 @@ class DeviceConnection {
 
       let frameLoadInFlight = false;
       const pollLiveFrame = () => {
+        if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
+        if (this.#displayState.lastH264FrameMs &&
+            (performance.now() - this.#displayState.lastH264FrameMs) < 1500) {
+          return;
+        }
         if (frameLoadInFlight) return;
         frameLoadInFlight = true;
         const img = new Image();
@@ -352,8 +367,36 @@ class DeviceConnection {
         this.#displayState.frameCount += 1;
         const fc = this.#displayState.frameCount;
 
+        if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideoFrame) {
+          ctx.drawImage(this.#displayState.remoteVideoFrame, 0, 0, width, height);
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
+            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
+            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
+            ctx.beginPath();
+            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+          }
+          drawMouseCursor();
+          return;
+        }
+
         if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideo) {
           ctx.drawImage(this.#displayState.remoteVideo, 0, 0, width, height);
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
+            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
+            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
+            ctx.beginPath();
+            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
+            ctx.fill();
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+          }
           drawMouseCursor();
           return;
         }
@@ -629,18 +672,146 @@ class DeviceConnection {
     });
   }
 
+  onH264Frame(message) {
+    if (!message || !message.data || typeof VideoDecoder === 'undefined') {
+      return;
+    }
+    let binStr;
+    try {
+      binStr = atob(message.data);
+    } catch (_) {
+      return;
+    }
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+
+    let sps = null;
+    let hasIdr = false;
+    let i = 0;
+    const len = bytes.length;
+    while (i + 3 < len) {
+      let scLen = 0;
+      if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) {
+        scLen = 3;
+      } else if (i + 4 < len && bytes[i] === 0 && bytes[i + 1] === 0 &&
+                 bytes[i + 2] === 0 && bytes[i + 3] === 1) {
+        scLen = 4;
+      }
+      if (scLen === 0) {
+        i++;
+        continue;
+      }
+      const nalStart = i + scLen;
+      if (nalStart >= len) break;
+      let next = nalStart;
+      while (next + 3 <= len) {
+        if (bytes[next] === 0 && bytes[next + 1] === 0 &&
+            (bytes[next + 2] === 1 ||
+             (next + 3 < len && bytes[next + 2] === 0 && bytes[next + 3] === 1))) {
+          break;
+        }
+        next++;
+      }
+      const nalEnd = (next + 3 <= len) ? next : len;
+      const nalType = bytes[nalStart] & 0x1f;
+      if (nalType === 7) {
+        sps = bytes.subarray(nalStart, nalEnd);
+      } else if (nalType === 5) {
+        hasIdr = true;
+      }
+      i = nalEnd;
+    }
+
+    if (!this.#displayState.videoDecoder ||
+        this.#displayState.videoDecoder.state === 'closed') {
+      this.#displayState.videoDecoder = new VideoDecoder({
+        output: (frame) => {
+          if (this.#displayState.remoteVideoFrame) {
+            try {
+              this.#displayState.remoteVideoFrame.close();
+            } catch (_) {}
+          }
+          this.#displayState.remoteVideoFrame = frame;
+          this.#displayState.videoFrameWidth =
+              frame.displayWidth || frame.codedWidth || 0;
+          this.#displayState.videoFrameHeight =
+              frame.displayHeight || frame.codedHeight || 0;
+          this.#displayState.hasRemoteFrames = true;
+          this.#displayState.lastH264FrameMs = performance.now();
+          if (this.#displayState.renderFrame) {
+            this.#displayState.renderFrame();
+          }
+        },
+        error: (e) => {
+          console.warn('VideoDecoder error:', e);
+        },
+      });
+      this.#displayState.videoDecoderCodec = null;
+    }
+
+    if (sps && sps.length >= 4) {
+      const hex = n => n.toString(16).padStart(2, '0');
+      const codec = `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`;
+      if (this.#displayState.videoDecoder.state === 'unconfigured' ||
+          this.#displayState.videoDecoderCodec !== codec) {
+        try {
+          this.#displayState.videoDecoder.configure({
+            codec,
+            optimizeForLatency: true,
+          });
+          this.#displayState.videoDecoderCodec = codec;
+        } catch (e) {
+          console.warn('VideoDecoder configure error:', e);
+          return;
+        }
+      }
+    } else if (this.#displayState.videoDecoder.state === 'unconfigured') {
+      try {
+        const codec = 'avc1.42e01f';
+        this.#displayState.videoDecoder.configure({
+          codec,
+          optimizeForLatency: true,
+        });
+        this.#displayState.videoDecoderCodec = codec;
+      } catch (_) {
+        return;
+      }
+    }
+
+    if (this.#displayState.videoDecoder.state === 'configured') {
+      try {
+        this.#displayState.videoDecoder.decode(new EncodedVideoChunk({
+          type: (message.keyframe || hasIdr) ? 'key' : 'delta',
+          timestamp: Number(message.timestamp_us || Math.round(performance.now() * 1000)),
+          data: bytes,
+        }));
+      } catch (e) {
+        console.warn('VideoDecoder decode error:', e);
+      }
+    }
+  }
+
   // TODO (b/124121375): This should probably be an array of pointer events and
   // have different properties.
   sendMultiTouch({idArr, xArr, yArr, down, device_label}) {
     let scaledX = xArr;
     let scaledY = yArr;
+    const rv = this.#displayState.remoteVideo;
     const img = this.#displayState.remoteImage;
+    const srcW = this.#displayState.videoFrameWidth ||
+        (rv && rv.videoWidth > 0 ? rv.videoWidth : 0) ||
+        (img && img.naturalWidth > 0 ? img.naturalWidth : 0);
+    const srcH = this.#displayState.videoFrameHeight ||
+        (rv && rv.videoHeight > 0 ? rv.videoHeight : 0) ||
+        (img && img.naturalHeight > 0 ? img.naturalHeight : 0);
     const cw = this.#displayState.canvasWidth || 0;
     const ch = this.#displayState.canvasHeight || 0;
-    if (img && img.naturalWidth > 0 && img.naturalHeight > 0 && cw > 0 && ch > 0 &&
-        (cw !== img.naturalWidth || ch !== img.naturalHeight)) {
-      scaledX = (xArr || []).map(x => Math.round(x * img.naturalWidth / cw));
-      scaledY = (yArr || []).map(y => Math.round(y * img.naturalHeight / ch));
+    if (srcW > 0 && srcH > 0 && cw > 0 && ch > 0 &&
+        (cw !== srcW || ch !== srcH)) {
+      scaledX = (xArr || []).map(x => Math.round(x * srcW / cw));
+      scaledY = (yArr || []).map(y => Math.round(y * srcH / ch));
     }
     if (xArr && xArr.length > 0 && yArr && yArr.length > 0) {
       this.#displayState.touchX = xArr[0];
@@ -908,6 +1079,7 @@ class DeviceConnection {
 class Controller {
   #pc;
   #serverConnector;
+  #deviceConnection = null;
   #connectedPr = Promise.resolve({});
   // A list of callbacks that need to be called when the remote description is
   // successfully added to the peer connection.
@@ -917,6 +1089,10 @@ class Controller {
   constructor(serverConnector) {
     this.#serverConnector = serverConnector;
     serverConnector.onDeviceMsg(msg => this.#onDeviceMessage(msg));
+  }
+
+  setDeviceConnection(deviceConnection) {
+    this.#deviceConnection = deviceConnection;
   }
 
   sendDataChannelFallback(channelLabel, payload) {
@@ -944,6 +1120,11 @@ class Controller {
             sdpMLineIndex: message.mLineIndex !== undefined ? message.mLineIndex : 0,
             candidate: message.candidate
           }));
+        break;
+      case 'h264-frame':
+        if (this.#deviceConnection) {
+          this.#deviceConnection.onH264Frame(message);
+        }
         break;
       case 'error':
         console.error('Device responded with error message: ', message.error);

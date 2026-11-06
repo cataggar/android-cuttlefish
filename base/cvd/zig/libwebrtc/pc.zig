@@ -787,7 +787,7 @@ const PeerConnectionImpl = struct {
                 if (self.remote_udp_addr == null) {
                     self.remote_udp_addr = .{ .ip = src_ip, .port = src_port };
                 }
-                if (pkt.len > 0 and pkt[0] == @intFromEnum(dtls_srtp.ContentType.application_data) and self.dtls_ready) {
+                if (pkt.len > 0 and pkt[0] == @intFromEnum(dtls_srtp.ContentType.application_data) and self.dtls_session.state == .connected) {
                     var plain_buf: [4096]u8 = undefined;
                     if (self.dtls_session.unprotectApplicationData(pkt, &plain_buf)) |dec_slice| {
                         try self.sctp_assoc.handleInboundPacket(dec_slice);
@@ -807,7 +807,7 @@ const PeerConnectionImpl = struct {
                     if (out_flight.len > 0) {
                         try self.ice_agent.sendUdp(src_ip, src_port, out_flight);
                     }
-                    if (self.dtls_session.state == .connected and !self.dtls_ready) {
+                    if (self.dtls_session.state == .connected) {
                         if (self.dtls_session.srtp_keys) |km| {
                             const rx_role: dtls_srtp.Role = if (self.dtls_session.role == .client) .server else .client;
                             self.srtp_tx = try dtls_srtp.SrtpContext.initFromKeyMaterial(km, self.dtls_session.role);
@@ -1125,13 +1125,27 @@ const PeerConnectionImpl = struct {
             peer.setState(.connected);
         } else {
             if (!self.dtls_ready) {
-                self.dtls_session.role = .client;
+                var loopback_client = dtls_srtp.DtlsSession{
+                    .role = .client,
+                    .config = self.dtls_session.config,
+                    .certificate = self.dtls_session.certificate,
+                    .local_random = self.dtls_session.local_random,
+                };
                 self.dtls_peer_loopback.role = .server;
-                if (runDtlsHandshakePair(&self.dtls_session, &self.dtls_peer_loopback)) {
-                    const km = self.dtls_session.srtp_keys orelse return;
+                if (runDtlsHandshakePair(&loopback_client, &self.dtls_peer_loopback)) {
+                    const km = loopback_client.srtp_keys orelse return;
                     self.srtp_tx = dtls_srtp.SrtpContext.initFromKeyMaterial(km, .client) catch return;
                     self.srtp_rx = dtls_srtp.SrtpContext.initFromKeyMaterial(km, .client) catch return;
                     self.dtls_ready = true;
+                }
+                if (self.dtls_session.state != .connected) {
+                    self.dtls_session = .{
+                        .role = .server,
+                        .config = self.dtls_session.config,
+                        .certificate = self.dtls_session.certificate,
+                        .local_random = self.dtls_session.local_random,
+                        .expected_remote_fingerprint = self.dtls_session.expected_remote_fingerprint,
+                    };
                 }
             }
             if (self.sctp_assoc.state != .established) {
@@ -2286,6 +2300,100 @@ test "Real UDP socket STUN connectivity check and SRTP/SCTP packet exchange via 
     try std.testing.expectEqual(@as(usize, 1), rx_track.dc_messages);
     try std.testing.expectEqualStrings(payload, rx_track.last_msg[0..rx_track.last_msg_len]);
 }
+
+test "UDP peer DTLS server handshake succeeds after SDP negotiation without paired_peer" {
+    var factory = try Factory.init();
+    defer factory.deinit();
+
+    var pc_server = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{},
+    );
+    defer pc_server.deinit();
+
+    var pc_client = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{},
+    );
+    defer pc_client.deinit();
+
+    const server_impl: *PeerConnectionImpl = @ptrCast(@alignCast(pc_server.handle));
+    const client_impl: *PeerConnectionImpl = @ptrCast(@alignCast(pc_client.handle));
+    unregisterPeer(server_impl);
+    unregisterPeer(client_impl);
+    server_impl.paired_peer = null;
+    client_impl.paired_peer = null;
+
+    try server_impl.setIceHosts(.{ 127, 0, 0, 1 }, null);
+    try client_impl.setIceHosts(.{ 127, 0, 0, 1 }, null);
+
+    const SdpCapture = struct {
+        buf: [4096]u8 = undefined,
+        len: usize = 0,
+
+        fn onSdp(
+            user_data: ?*anyopaque,
+            _: c.cf_webrtc_sdp_type_t,
+            sdp_ptr: [*]const u8,
+            sdp_len: usize,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            const copy_len = @min(sdp_len, self.buf.len);
+            @memcpy(self.buf[0..copy_len], sdp_ptr[0..copy_len]);
+            self.len = copy_len;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    // Server creates offer, sets local description, and sets remote answer (triggering establishDtlsAndSctp)
+    var offer_cap = SdpCapture{};
+    try pc_server.createOffer(SdpCapture.onSdp, &offer_cap);
+    const offer_sdp = offer_cap.slice();
+    try std.testing.expect(std.mem.indexOf(u8, offer_sdp, "a=msid:display_0 display_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, offer_sdp, "a=ssrc:573785173 msid:display_0 display_0") != null);
+
+    try pc_server.setLocalDescription(.{ .sdp_type = .offer, .sdp_text = offer_sdp });
+    try pc_client.setRemoteDescription(.{ .sdp_type = .offer, .sdp_text = offer_sdp });
+    var answer_cap = SdpCapture{};
+    try pc_client.createAnswer(SdpCapture.onSdp, &answer_cap);
+    const answer_sdp = answer_cap.slice();
+    try pc_server.setRemoteDescription(.{ .sdp_type = .answer, .sdp_text = answer_sdp });
+
+    // Server dtls_session must remain in .server role and .new state ready for UDP ClientHello
+    try std.testing.expectEqual(dtls_srtp.Role.server, server_impl.dtls_session.role);
+    try std.testing.expect(server_impl.dtls_session.state == .new);
+
+    const server_port = pc_server.getBoundPort();
+    const client_port = pc_client.getBoundPort();
+    server_impl.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = client_port };
+    client_impl.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = server_port };
+
+    // Client initiates real DTLS handshake over UDP against server after SDP completion
+    client_impl.dtls_session.role = .client;
+    var flight1_buf: [4096]u8 = undefined;
+    const flight1 = try client_impl.dtls_session.startHandshake(&flight1_buf);
+    try client_impl.sendUdpToActivePeer(flight1);
+
+    try std.testing.expect(try pc_server.pollUdpOnce());
+    try std.testing.expect(try pc_client.pollUdpOnce());
+    try std.testing.expect(try pc_server.pollUdpOnce());
+    try std.testing.expect(try pc_client.pollUdpOnce());
+
+    try std.testing.expect(server_impl.dtls_session.state == .connected);
+    try std.testing.expect(client_impl.dtls_session.state == .connected);
+
+    // Server pushes SRTP H.264 RTP packet encrypted with UDP-negotiated keys and client decrypts it
+    const pkts_sent = try server_impl.pushVideoFrame("udp-dtls-after-sdp", true, 90000);
+    try std.testing.expect(pkts_sent >= 1);
+    _ = try pc_client.pumpUdpSocket();
+    try std.testing.expect(client_impl.srtp_packets_received.load(.acquire) >= pkts_sent);
+}
+
 
 
 
