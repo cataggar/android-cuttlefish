@@ -717,6 +717,7 @@ const PeerConnectionImpl = struct {
     local_pwd_buf: [48]u8 = @splat(0),
     local_pwd_len: usize = 0,
     local_sdp: ?[]u8 = null,
+    local_parsed: ?sdp.ParsedSdp = null,
     remote_sdp: ?[]u8 = null,
     remote_parsed: ?sdp.ParsedSdp = null,
     ice_agent: ice.Agent,
@@ -1094,6 +1095,27 @@ const PeerConnectionImpl = struct {
         return client.state == .connected and server.state == .connected;
     }
 
+    fn effectiveSetup(parsed: *const sdp.ParsedSdp) sdp.SetupRole {
+        for (parsed.media_sections) |sec| {
+            if (sec.port != 0) return sec.setup;
+        }
+        if (parsed.media_sections.len > 0) return parsed.media_sections[0].setup;
+        return parsed.setup;
+    }
+
+    fn negotiatedUdpDtlsRole(self: *const PeerConnectionImpl) dtls_srtp.Role {
+        const local_setup: ?sdp.SetupRole = if (self.local_parsed) |*lp| effectiveSetup(lp) else null;
+        const remote_setup: ?sdp.SetupRole = if (self.remote_parsed) |*rp| effectiveSetup(rp) else null;
+
+        if (local_setup == .active and remote_setup != .active) {
+            return .client;
+        }
+        if (remote_setup == .passive) {
+            return .client;
+        }
+        return .server;
+    }
+
     fn establishDtlsAndSctp(self: *PeerConnectionImpl) void {
         if (self.paired_peer) |peer| {
             if (!self.dtls_ready or !peer.dtls_ready) {
@@ -1124,6 +1146,7 @@ const PeerConnectionImpl = struct {
             self.setState(.connected);
             peer.setState(.connected);
         } else {
+            const negotiated_role = self.negotiatedUdpDtlsRole();
             if (!self.dtls_ready) {
                 var loopback_client = dtls_srtp.DtlsSession{
                     .role = .client,
@@ -1138,14 +1161,26 @@ const PeerConnectionImpl = struct {
                     self.srtp_rx = dtls_srtp.SrtpContext.initFromKeyMaterial(km, .client) catch return;
                     self.dtls_ready = true;
                 }
-                if (self.dtls_session.state != .connected) {
+            }
+            if (self.dtls_session.state != .connected) {
+                if (self.dtls_session.state == .new or self.dtls_session.role != negotiated_role) {
                     self.dtls_session = .{
-                        .role = .server,
+                        .role = negotiated_role,
                         .config = self.dtls_session.config,
                         .certificate = self.dtls_session.certificate,
                         .local_random = self.dtls_session.local_random,
                         .expected_remote_fingerprint = self.dtls_session.expected_remote_fingerprint,
                     };
+                }
+                if (negotiated_role == .client and
+                    self.dtls_session.state == .new and
+                    self.remote_udp_addr != null and
+                    self.ice_agent.socket_fd != null)
+                {
+                    var flight1_buf: [4096]u8 = undefined;
+                    if (self.dtls_session.startHandshake(&flight1_buf)) |flight1| {
+                        self.sendUdpToActivePeer(flight1) catch {};
+                    } else |_| {}
                 }
             }
             if (self.sctp_assoc.state != .established) {
@@ -1780,9 +1815,13 @@ pub export fn cf_webrtc_pc_set_local_description(
 
     const sdp_text = ptr[0..sdp_len];
     var parsed = sdp.parseSdp(engine_allocator, sdp_text) catch return c.CF_WEBRTC_ERR_INVALID_ARG;
-    parsed.deinit();
 
-    const copy = engine_allocator.dupe(u8, sdp_text) catch return c.CF_WEBRTC_ERR_INTERNAL;
+    const copy = engine_allocator.dupe(u8, sdp_text) catch {
+        parsed.deinit();
+        return c.CF_WEBRTC_ERR_INTERNAL;
+    };
+    if (impl.local_parsed) |*old_parsed| old_parsed.deinit();
+    impl.local_parsed = parsed;
     if (impl.local_sdp) |old| engine_allocator.free(old);
     impl.local_sdp = copy;
 
@@ -2049,6 +2088,7 @@ pub export fn cf_webrtc_pc_destroy(pc_handle: ?*c.cf_webrtc_pc_t) callconv(.c) v
         }
     }
     if (impl.local_sdp) |s| engine_allocator.free(s);
+    if (impl.local_parsed) |*p| p.deinit();
     if (impl.remote_sdp) |s| engine_allocator.free(s);
     if (impl.remote_parsed) |*p| p.deinit();
     impl.ice_agent.deinit();
@@ -2373,11 +2413,11 @@ test "UDP peer DTLS server handshake succeeds after SDP negotiation without pair
     server_impl.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = client_port };
     client_impl.remote_udp_addr = .{ .ip = .{ 127, 0, 0, 1 }, .port = server_port };
 
-    // Client initiates real DTLS handshake over UDP against server after SDP completion
-    client_impl.dtls_session.role = .client;
-    var flight1_buf: [4096]u8 = undefined;
-    const flight1 = try client_impl.dtls_session.startHandshake(&flight1_buf);
-    try client_impl.sendUdpToActivePeer(flight1);
+    // Answerer sets local description (`a=setup:active`) -> negotiated DTLS role is .client
+    // and establishDtlsAndSctp automatically initiates startHandshake and sends Flight 1 over UDP
+    try pc_client.setLocalDescription(.{ .sdp_type = .answer, .sdp_text = answer_sdp });
+    try std.testing.expectEqual(dtls_srtp.Role.client, client_impl.dtls_session.role);
+    try std.testing.expect(client_impl.dtls_session.state == .connecting);
 
     try std.testing.expect(try pc_server.pollUdpOnce());
     try std.testing.expect(try pc_client.pollUdpOnce());
@@ -2392,6 +2432,104 @@ test "UDP peer DTLS server handshake succeeds after SDP negotiation without pair
     try std.testing.expect(pkts_sent >= 1);
     _ = try pc_client.pumpUdpSocket();
     try std.testing.expect(client_impl.srtp_packets_received.load(.acquire) >= pkts_sent);
+}
+
+test "UDP peer DTLS answerer role and passive-answer offerer role negotiate client over UDP without paired_peer" {
+    var factory = try Factory.init();
+    defer factory.deinit();
+
+    var pc_offerer = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{},
+    );
+    defer pc_offerer.deinit();
+
+    var pc_answerer = try PeerConnection.init(
+        &factory,
+        .{ .port_range = .{ .min_port = 15550, .max_port = 15599 } },
+        .{},
+    );
+    defer pc_answerer.deinit();
+
+    const offerer_impl: *PeerConnectionImpl = @ptrCast(@alignCast(pc_offerer.handle));
+    const answerer_impl: *PeerConnectionImpl = @ptrCast(@alignCast(pc_answerer.handle));
+    unregisterPeer(offerer_impl);
+    unregisterPeer(answerer_impl);
+    offerer_impl.paired_peer = null;
+    answerer_impl.paired_peer = null;
+
+    try offerer_impl.setIceHosts(.{ 127, 0, 0, 1 }, null);
+    try answerer_impl.setIceHosts(.{ 127, 0, 0, 1 }, null);
+
+    const SdpCapture = struct {
+        buf: [4096]u8 = undefined,
+        len: usize = 0,
+
+        fn onSdp(
+            user_data: ?*anyopaque,
+            _: c.cf_webrtc_sdp_type_t,
+            sdp_ptr: [*]const u8,
+            sdp_len: usize,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            const copy_len = @min(sdp_len, self.buf.len);
+            @memcpy(self.buf[0..copy_len], sdp_ptr[0..copy_len]);
+            self.len = copy_len;
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    var offer_cap = SdpCapture{};
+    try pc_offerer.createOffer(SdpCapture.onSdp, &offer_cap);
+    const offer_sdp = offer_cap.slice();
+
+    try pc_offerer.setLocalDescription(.{ .sdp_type = .offer, .sdp_text = offer_sdp });
+    try pc_answerer.setRemoteDescription(.{ .sdp_type = .offer, .sdp_text = offer_sdp });
+
+    var answer_cap = SdpCapture{};
+    try pc_answerer.createAnswer(SdpCapture.onSdp, &answer_cap);
+    const answer_sdp = answer_cap.slice();
+
+    // Set local answer BEFORE remote UDP address is known; role must be .client and state .new
+    try pc_answerer.setLocalDescription(.{ .sdp_type = .answer, .sdp_text = answer_sdp });
+    try std.testing.expectEqual(dtls_srtp.Role.client, answerer_impl.dtls_session.role);
+    try std.testing.expectEqual(dtls_srtp.TransportState.new, answerer_impl.dtls_session.state);
+
+    try pc_offerer.setRemoteDescription(.{ .sdp_type = .answer, .sdp_text = answer_sdp });
+    try std.testing.expectEqual(dtls_srtp.Role.server, offerer_impl.dtls_session.role);
+    try std.testing.expectEqual(dtls_srtp.TransportState.new, offerer_impl.dtls_session.state);
+
+    // Adding remote ICE candidate to answerer populates remote_udp_addr and triggers Flight 1 over UDP
+    var offerer_cand_buf: [192]u8 = @splat(0);
+    const offerer_cand_slice = try offerer_impl.ice_agent.local_candidates.items[0].formatSdp(
+        offerer_cand_buf[0 .. offerer_cand_buf.len - 1],
+    );
+    offerer_cand_buf[offerer_cand_slice.len] = 0;
+    const c_cand = c.cf_webrtc_ice_candidate_t{
+        .sdp_mid = "0",
+        .sdp_mline_index = 0,
+        .candidate_sdp = @ptrCast(&offerer_cand_buf),
+    };
+    try std.testing.expectEqual(c.CF_WEBRTC_OK, cf_webrtc_pc_add_ice_candidate(pc_answerer.handle, &c_cand));
+    try std.testing.expectEqual(dtls_srtp.TransportState.connecting, answerer_impl.dtls_session.state);
+
+    try std.testing.expect(try pc_offerer.pollUdpOnce());
+    try std.testing.expect(try pc_answerer.pollUdpOnce());
+    try std.testing.expect(try pc_offerer.pollUdpOnce());
+    try std.testing.expect(try pc_answerer.pollUdpOnce());
+
+    try std.testing.expectEqual(dtls_srtp.TransportState.connected, offerer_impl.dtls_session.state);
+    try std.testing.expectEqual(dtls_srtp.TransportState.connected, answerer_impl.dtls_session.state);
+
+    // Answerer pushes SRTP video frame to offerer over UDP
+    const pkts_sent = try answerer_impl.pushVideoFrame("answerer-to-offerer-h264", true, 90000);
+    try std.testing.expect(pkts_sent >= 1);
+    _ = try pc_offerer.pumpUdpSocket();
+    try std.testing.expect(offerer_impl.srtp_packets_received.load(.acquire) >= pkts_sent);
 }
 
 

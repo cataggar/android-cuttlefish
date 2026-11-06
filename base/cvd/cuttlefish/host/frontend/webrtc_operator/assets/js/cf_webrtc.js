@@ -861,6 +861,25 @@ class DeviceConnection {
   }
 
   disconnect() {
+    if (this.#displayState.remoteVideoFrame) {
+      try {
+        this.#displayState.remoteVideoFrame.close();
+      } catch (_) {}
+      this.#displayState.remoteVideoFrame = null;
+    }
+    if (this.#displayState.videoDecoder) {
+      try {
+        if (this.#displayState.videoDecoder.state !== 'closed') {
+          this.#displayState.videoDecoder.close();
+        }
+      } catch (_) {}
+      this.#displayState.videoDecoder = null;
+    }
+    this.#displayState.videoDecoderCodec = null;
+    this.#displayState.videoFrameWidth = 0;
+    this.#displayState.videoFrameHeight = 0;
+    this.#displayState.lastH264FrameMs = 0;
+    this.#displayState.hasRemoteFrames = false;
     this.#pc.close();
   }
 
