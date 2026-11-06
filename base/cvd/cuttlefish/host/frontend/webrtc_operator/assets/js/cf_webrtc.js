@@ -497,6 +497,27 @@ class DeviceConnection {
         }
         delete this.#streamPromiseResolvers[streamId];
       }
+
+      if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+        const forwardWindowKey = (e) => {
+          if (e.metaKey || e.ctrlKey) return;
+          const active = document.activeElement;
+          const dd = document.getElementById('device-displays');
+          if (active && dd && (active === dd || dd.contains(active))) {
+            return; // Handled by app.js listener on #device-displays
+          }
+          if (active) {
+            const tag = (active.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || active.isContentEditable) {
+              return;
+            }
+          }
+          e.preventDefault();
+          this.sendKeyEvent(e.code, e.type);
+        };
+        window.addEventListener('keydown', forwardWindowKey);
+        window.addEventListener('keyup', forwardWindowKey);
+      }
     }
   }
 
@@ -820,6 +841,16 @@ class DeviceConnection {
     this.#displayState.touchDown = !!down;
     this.#displayState.lastAction =
         `touch (${Math.round(this.#displayState.touchX)}, ${Math.round(this.#displayState.touchY)}) ${down ? 'down' : 'up'}`;
+    if (down && typeof document !== 'undefined') {
+      const dd = document.getElementById('device-displays');
+      if (dd && document.activeElement !== dd && typeof dd.focus === 'function') {
+        try {
+          dd.focus({preventScroll: true});
+        } catch (_err) {
+          dd.focus();
+        }
+      }
+    }
     let events = {
             type: 'multi-touch',
             id: idArr,
