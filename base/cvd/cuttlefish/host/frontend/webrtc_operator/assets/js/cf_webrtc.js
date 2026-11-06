@@ -789,15 +789,29 @@ class DeviceConnection {
     const targetCodec = (sps && sps.length >= 4)
         ? `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`
         : (this.#displayState.videoDecoderCodec || 'avc1.42e01f');
+    const msgWidth = Number(message.width || 0);
+    const msgHeight = Number(message.height || 0);
+    const dimsChanged = msgWidth > 0 && msgHeight > 0 &&
+        (msgWidth !== this.#displayState.videoDecoderWidth ||
+         msgHeight !== this.#displayState.videoDecoderHeight);
 
     try {
+      if (dimsChanged && !isKey) {
+        this.#displayState.videoDecoderNeedsKey = true;
+      }
+
       if ((sps && targetCodec !== this.#displayState.videoDecoderCodec) ||
+          (isKey && dimsChanged) ||
           this.#displayState.videoDecoder.state === 'unconfigured') {
         this.#displayState.videoDecoder.configure({
           codec: targetCodec,
           optimizeForLatency: true,
         });
         this.#displayState.videoDecoderCodec = targetCodec;
+        if (msgWidth > 0 && msgHeight > 0) {
+          this.#displayState.videoDecoderWidth = msgWidth;
+          this.#displayState.videoDecoderHeight = msgHeight;
+        }
         this.#displayState.videoDecoderNeedsKey = true;
       }
 
