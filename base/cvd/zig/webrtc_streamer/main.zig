@@ -33,7 +33,9 @@ pub fn runWithArgs(allocator: Allocator, args: []const []const u8) !void {
 
     var loop_idx: usize = 0;
     while (cfg.max_loops == 0 or loop_idx < cfg.max_loops) : (loop_idx += 1) {
-        frames.nextFrameI420(i420_buf);
+        if (cfg.max_loops > 0 and loop_idx == 0) {
+            frames.nextFrameI420(i420_buf);
+        }
         _ = client.pollUdpStunOnce() catch false;
 
         const maybe_msg = client.pollNextMessageAlloc(15) catch |err| switch (err) {
@@ -43,6 +45,15 @@ pub fn runWithArgs(allocator: Allocator, args: []const []const u8) !void {
         if (maybe_msg) |msg| {
             defer allocator.free(msg);
             try client.handleOperatorMessage(msg);
+            while (true) {
+                const next_msg = client.pollNextMessageAlloc(0) catch |err| switch (err) {
+                    error.ReadFailed, error.EndOfStream => break,
+                    else => return err,
+                } orelse break;
+                defer allocator.free(next_msg);
+                try client.handleOperatorMessage(next_msg);
+            }
+            client.input_sink.flushPendingMouse();
             _ = client.pollUdpStunOnce() catch false;
         }
     }

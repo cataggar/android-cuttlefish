@@ -18,10 +18,36 @@
 
 function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
   let activePointers = new Set();
+  let rightClickPointers = new Set();
+
+  function onContextMenu(e) {
+    e.preventDefault();
+  }
+
+  function updateHover(e, down) {
+    if (typeof dc.onDisplayHover === 'function') {
+      const [xs, ys] = scaleCoordinates(touchInputElement, e.offsetX, e.offsetY);
+      dc.onDisplayHover(xs, ys, down);
+    }
+  }
 
   function onPointerDown(e) {
     // Can't prevent event default behavior to allow the element gain focus
     // when touched and start capturing keyboard input in the parent.
+    updateHover(e, true);
+    if (e.button === 2) {
+      const pid = e.pointerId;
+      const target = e.target;
+      const ox = e.offsetX;
+      const oy = e.offsetY;
+      rightClickPointers.add(pid);
+      sendEventUpdate(dc, target, [{x: ox, y: oy, id: pid}], scaleCoordinates, true);
+      setTimeout(() => {
+        rightClickPointers.delete(pid);
+        sendEventUpdate(dc, target, [{x: ox, y: oy, id: pid}], scaleCoordinates, false);
+      }, 500);
+      return;
+    }
     activePointers.add(e.pointerId);
     sendEventUpdate(dc, e.target, [{x: e.offsetX, y: e.offsetY, id: e.pointerId}], scaleCoordinates, true);
   }
@@ -29,6 +55,10 @@ function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
   function onPointerUp(e) {
     // Can't prevent event default behavior to allow the element gain focus
     // when touched and start capturing keyboard input in the parent.
+    updateHover(e, false);
+    if (rightClickPointers.has(e.pointerId)) {
+      return;
+    }
     const wasDown = activePointers.delete(e.pointerId);
     if (!wasDown) {
       return;
@@ -39,13 +69,16 @@ function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
   function onPointerMove(e) {
     // Can't prevent event default behavior to allow the element gain focus
     // when touched and start capturing keyboard input in the parent.
-    if (!activePointers.has(e.pointerId)) {
+    const isDown = activePointers.has(e.pointerId);
+    updateHover(e, isDown);
+    if (!isDown) {
       // This is just a mouse move, not a drag
       return;
     }
     sendEventUpdate(dc, e.target, [{x: e.offsetX, y: e.offsetY, id: e.pointerId}], scaleCoordinates, true);
   }
 
+  touchInputElement.addEventListener('contextmenu', onContextMenu);
   touchInputElement.addEventListener('pointerdown', onPointerDown);
   touchInputElement.addEventListener('pointermove', onPointerMove);
   touchInputElement.addEventListener('pointerup', onPointerUp);

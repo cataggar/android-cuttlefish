@@ -42,7 +42,7 @@ async function ConnectDevice(deviceId, serverConnector) {
     }
   }, intervalMs);
 
-  let module = await import('./cf_webrtc.js?v=4');
+  let module = await import('./cf_webrtc.js?v=5');
   let deviceConnection = await module.Connect(deviceId, serverConnector);
   console.info('Connected to ' + deviceId);
   clearInterval(connectionInterval);

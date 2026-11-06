@@ -146,10 +146,15 @@ class DeviceConnection {
     touchX: 360,
     touchY: 640,
     touchDown: false,
+    mouseActive: false,
+    mouseX: 540,
+    mouseY: 1205,
+    mouseDown: false,
     lastAction: 'Ready',
     frameCount: 0,
     remoteVideo: null,
     hasRemoteFrames: false,
+    renderFrame: null,
   };
 
   constructor(pc, control) {
@@ -285,7 +290,41 @@ class DeviceConnection {
       canvas.height = height;
       this.#displayState.canvasWidth = width;
       this.#displayState.canvasHeight = height;
+      this.#displayState.mouseX = Math.round(width / 2);
+      this.#displayState.mouseY = Math.round(height / 2);
       const ctx = canvas.getContext('2d');
+
+      const drawMouseCursor = () => {
+        if (!this.#displayState.mouseActive) return;
+        const mx = Math.max(0, Math.min(width - 1, this.#displayState.mouseX));
+        const my = Math.max(0, Math.min(height - 1, this.#displayState.mouseY));
+        ctx.save();
+        ctx.translate(mx, my);
+        if (this.#displayState.mouseDown) {
+          ctx.beginPath();
+          ctx.arc(0, 0, 22, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.38)';
+          ctx.fill();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#38bdf8';
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, 36);
+        ctx.lineTo(9, 27);
+        ctx.lineTo(16, 42);
+        ctx.lineTo(22, 39);
+        ctx.lineTo(15, 24);
+        ctx.lineTo(27, 24);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+        ctx.restore();
+      };
 
       let frameLoadInFlight = false;
       const pollLiveFrame = () => {
@@ -315,12 +354,13 @@ class DeviceConnection {
 
         if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideo) {
           ctx.drawImage(this.#displayState.remoteVideo, 0, 0, width, height);
+          drawMouseCursor();
           return;
         }
 
         if (this.#displayState.remoteImage && this.#displayState.remoteImage.naturalWidth > 0) {
           ctx.drawImage(this.#displayState.remoteImage, 0, 0, width, height);
-          if (this.#displayState.touchDown) {
+          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
             const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
             const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
             ctx.beginPath();
@@ -331,6 +371,7 @@ class DeviceConnection {
             ctx.strokeStyle = '#38bdf8';
             ctx.stroke();
           }
+          drawMouseCursor();
           return;
         }
 
@@ -398,8 +439,10 @@ class DeviceConnection {
         ctx.fillRect(0, height - 72, width, 72);
         ctx.fillStyle = '#cbd5e1';
         ctx.fillRect(width / 2 - 70, height - 40, 140, 8);
+        drawMouseCursor();
       };
 
+      this.#displayState.renderFrame = renderFrame;
       renderFrame();
       setInterval(renderFrame, Math.max(16, Math.floor(1000 / fps)));
 
@@ -474,25 +517,99 @@ class DeviceConnection {
     this.#inputChannel.send(JSON.stringify(evt));
   }
 
+  setMouseMode(active) {
+    this.#displayState.mouseActive = !!active;
+    if (!active) {
+      this.#displayState.mouseDown = false;
+      this.#sendJsonInput({type: 'mouseMove', x: -1, y: -1, abs: 1});
+    }
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+  }
+
+  onDisplayHover(x, y, down) {
+    if (!this.#displayState.mouseActive) return;
+    const cw = this.#displayState.canvasWidth || 1080;
+    const ch = this.#displayState.canvasHeight || 2410;
+    this.#displayState.mouseX = Math.max(0, Math.min(cw - 1, Math.round(x)));
+    this.#displayState.mouseY = Math.max(0, Math.min(ch - 1, Math.round(y)));
+    this.#displayState.mouseDown = !!down;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+  }
+
   sendMouseMove({x, y}) {
-    this.#displayState.touchX = x;
-    this.#displayState.touchY = y;
-    this.#displayState.lastAction = `mouse (${Math.round(x)}, ${Math.round(y)})`;
-    this.#sendJsonInput({
-      type: 'mouseMove',
-      x,
-      y,
-    });
+    const cw = this.#displayState.canvasWidth || 1080;
+    const ch = this.#displayState.canvasHeight || 2410;
+    const scale = Math.max(1.2, cw / 540);
+    this.#displayState.mouseActive = true;
+    this.#displayState.mouseX = Math.max(
+        0, Math.min(cw - 1, (this.#displayState.mouseX || cw / 2) + x * scale));
+    this.#displayState.mouseY = Math.max(
+        0, Math.min(ch - 1, (this.#displayState.mouseY || ch / 2) + y * scale));
+    const mx = Math.round(this.#displayState.mouseX);
+    const my = Math.round(this.#displayState.mouseY);
+    this.#displayState.touchX = mx;
+    this.#displayState.touchY = my;
+    this.#displayState.lastAction = `mouse (${mx}, ${my})`;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+    if (this.#displayState.mouseDown) {
+      this.sendMultiTouch({
+        idArr: [0],
+        xArr: [mx],
+        yArr: [my],
+        down: true,
+        device_label: 'display_0',
+      });
+    }
   }
 
   sendMouseButton({button, down}) {
-    this.#displayState.touchDown = !!down;
-    this.#displayState.lastAction = `mouseBtn ${button} ${down ? 'down' : 'up'}`;
-    this.#sendJsonInput({
-      type: 'mouseButton',
-      button: button,
-      down: down ? 1 : 0,
-    });
+    const isDown = !!down;
+    this.#displayState.mouseActive = true;
+    const prevDown = !!this.#displayState.mouseDown;
+    this.#displayState.mouseDown = isDown;
+    this.#displayState.touchDown = isDown;
+    const mx = Math.round(this.#displayState.mouseX || (this.#displayState.canvasWidth || 1080) / 2);
+    const my = Math.round(this.#displayState.mouseY || (this.#displayState.canvasHeight || 2410) / 2);
+    this.#displayState.lastAction = `mouseBtn ${button} ${isDown ? 'down' : 'up'} (${mx}, ${my})`;
+    if (this.#displayState.renderFrame) {
+      this.#displayState.renderFrame();
+    }
+    if (button === 2) {
+      if (isDown && !prevDown) {
+        this.sendMultiTouch({
+          idArr: [0],
+          xArr: [mx],
+          yArr: [my],
+          down: true,
+          device_label: 'display_0',
+        });
+        setTimeout(() => {
+          this.sendMultiTouch({
+            idArr: [0],
+            xArr: [mx],
+            yArr: [my],
+            down: false,
+            device_label: 'display_0',
+          });
+        }, 500);
+      }
+      return;
+    }
+    if (isDown !== prevDown) {
+      this.sendMultiTouch({
+        idArr: [0],
+        xArr: [mx],
+        yArr: [my],
+        down: isDown,
+        device_label: 'display_0',
+      });
+    }
   }
 
   sendGamepadKey({id, button, down}) {

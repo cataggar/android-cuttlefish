@@ -63,6 +63,23 @@ fn parseDownValue(val: std.json.Value) bool {
     };
 }
 
+fn parseI32Clamped(val: std.json.Value) ?i32 {
+    return switch (val) {
+        .integer => |i| blk: {
+            if (i <= std.math.minInt(i32)) break :blk std.math.minInt(i32);
+            if (i >= std.math.maxInt(i32)) break :blk std.math.maxInt(i32);
+            break :blk @intCast(i);
+        },
+        .float => |f| blk: {
+            if (f <= -2147483648.0) break :blk std.math.minInt(i32);
+            if (f >= 2147483647.0) break :blk std.math.maxInt(i32);
+            break :blk @intFromFloat(f);
+        },
+        .array => |arr| if (arr.items.len > 0) parseI32Clamped(arr.items[0]) else null,
+        else => null,
+    };
+}
+
 fn parseU16Clamped(val: std.json.Value) ?u16 {
     return switch (val) {
         .integer => |i| blk: {
@@ -158,6 +175,33 @@ pub fn parseInputJson(allocator: std.mem.Allocator, raw_json: []const u8) InputE
         .string => |s| s,
         else => return error.MissingEventType,
     };
+
+    if (std.mem.eql(u8, ev_type, "mouseMove")) {
+        const dx = if (root.get("x")) |xv| (parseI32Clamped(xv) orelse 0) else 0;
+        const dy = if (root.get("y")) |yv| (parseI32Clamped(yv) orelse 0) else 0;
+        return .{
+            .touch = .{
+                .action = TOUCH_ACTION_MOVE,
+                .pointer_id = 0,
+                .x = @intCast(std.math.clamp(540 + dx, 0, 65535)),
+                .y = @intCast(std.math.clamp(1205 + dy, 0, 65535)),
+                .pressure = 0,
+            },
+        };
+    }
+
+    if (std.mem.eql(u8, ev_type, "mouseButton") or std.mem.eql(u8, ev_type, "mouseWheel")) {
+        const is_down = if (root.get("down")) |dv| parseDownValue(dv) else false;
+        return .{
+            .touch = .{
+                .action = if (is_down) TOUCH_ACTION_DOWN else TOUCH_ACTION_UP,
+                .pointer_id = 0,
+                .x = 540,
+                .y = 1205,
+                .pressure = if (is_down) DEFAULT_PRESSURE else 0,
+            },
+        };
+    }
 
     if (std.mem.eql(u8, ev_type, "touch") or
         std.mem.eql(u8, ev_type, "multi-touch") or
@@ -294,12 +338,118 @@ pub fn formatUinputCommand(ev: InputEvent, buf: []u8) InputError![]const u8 {
 pub const InputSink = struct {
     uinput_socket_path: ?[]const u8 = null,
     pointer_down: bool = false,
+    mouse_x: i32 = 540,
+    mouse_y: i32 = 1205,
+    mouse_down: bool = false,
+    mouse_dirty: bool = false,
 
     pub fn init(uinput_socket_path: ?[]const u8) InputSink {
         return .{ .uinput_socket_path = uinput_socket_path };
     }
 
+    pub fn flushPendingMouse(self: *InputSink) void {
+        if (!self.mouse_dirty) return;
+        self.mouse_dirty = false;
+        const sock_path = self.uinput_socket_path orelse return;
+        if (sock_path.len == 0) return;
+
+        if (self.mouse_x < 0 or self.mouse_y < 0) {
+            writeUnixStreamPacket(sock_path, "p 2000 3000 0\nc\n") catch {};
+            return;
+        }
+        const mx: u16 = @intCast(std.math.clamp(self.mouse_x, 0, 1079));
+        const my: u16 = @intCast(std.math.clamp(self.mouse_y, 0, 2409));
+        var cmd_buf: [128]u8 = undefined;
+        const cmd = if (self.mouse_down)
+            std.fmt.bufPrint(&cmd_buf, "p {d} {d} 1\nm 0 {d} {d} {d}\nc\n", .{ mx, my, mx, my, DEFAULT_PRESSURE }) catch ""
+        else
+            std.fmt.bufPrint(&cmd_buf, "p {d} {d} 0\nc\n", .{ mx, my }) catch "";
+        if (cmd.len > 0) writeUnixStreamPacket(sock_path, cmd) catch {};
+    }
+
     pub fn handleDataChannelJson(self: *InputSink, allocator: std.mem.Allocator, raw_json: []const u8) !InputEvent {
+        if (std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                const root = parsed.value.object;
+                if (root.get("type") orelse root.get("event_type") orelse root.get("message_type")) |tv| {
+                    if (tv == .string) {
+                        if (std.mem.eql(u8, tv.string, "mouseMove")) {
+                            const dx = if (root.get("x")) |xv| (parseI32Clamped(xv) orelse 0) else 0;
+                            const dy = if (root.get("y")) |yv| (parseI32Clamped(yv) orelse 0) else 0;
+                            const is_abs = if (root.get("abs")) |av| parseDownValue(av) else false;
+                            if (dx < 0 and dy < 0 and is_abs) {
+                                self.mouse_x = -1;
+                                self.mouse_y = -1;
+                                self.mouse_dirty = true;
+                                return .{
+                                    .touch = .{
+                                        .action = TOUCH_ACTION_MOVE,
+                                        .pointer_id = 0,
+                                        .x = 0,
+                                        .y = 0,
+                                        .pressure = 0,
+                                    },
+                                };
+                            }
+                            if (is_abs) {
+                                self.mouse_x = std.math.clamp(dx, 0, 1079);
+                                self.mouse_y = std.math.clamp(dy, 0, 2409);
+                            } else {
+                                if (self.mouse_x < 0) self.mouse_x = 540;
+                                if (self.mouse_y < 0) self.mouse_y = 1205;
+                                self.mouse_x = std.math.clamp(self.mouse_x + dx * 2, 0, 1079);
+                                self.mouse_y = std.math.clamp(self.mouse_y + dy * 2, 0, 2409);
+                            }
+                            self.mouse_dirty = true;
+                            const mx: u16 = @intCast(self.mouse_x);
+                            const my: u16 = @intCast(self.mouse_y);
+                            return .{
+                                .touch = .{
+                                    .action = TOUCH_ACTION_MOVE,
+                                    .pointer_id = 0,
+                                    .x = mx,
+                                    .y = my,
+                                    .pressure = if (self.mouse_down) DEFAULT_PRESSURE else 0,
+                                },
+                            };
+                        } else if (std.mem.eql(u8, tv.string, "mouseButton")) {
+                            const is_down = if (root.get("down")) |dv| parseDownValue(dv) else false;
+                            const was_down = self.mouse_down;
+                            self.mouse_down = is_down;
+                            self.pointer_down = is_down;
+                            if (self.mouse_x < 0) self.mouse_x = 540;
+                            if (self.mouse_y < 0) self.mouse_y = 1205;
+                            const mx: u16 = @intCast(std.math.clamp(self.mouse_x, 0, 1079));
+                            const my: u16 = @intCast(std.math.clamp(self.mouse_y, 0, 2409));
+                            if (is_down != was_down) {
+                                self.mouse_dirty = false;
+                                if (self.uinput_socket_path) |sock_path| {
+                                    if (sock_path.len > 0) {
+                                        var cmd_buf: [128]u8 = undefined;
+                                        const cmd = if (is_down)
+                                            std.fmt.bufPrint(&cmd_buf, "p {d} {d} 1\nd 0 {d} {d} {d}\nc\n", .{ mx, my, mx, my, DEFAULT_PRESSURE }) catch ""
+                                        else
+                                            std.fmt.bufPrint(&cmd_buf, "p {d} {d} 0\nu 0\nc\n", .{ mx, my }) catch "";
+                                        if (cmd.len > 0) writeUnixStreamPacket(sock_path, cmd) catch {};
+                                    }
+                                }
+                            }
+                            return .{
+                                .touch = .{
+                                    .action = if (is_down) TOUCH_ACTION_DOWN else TOUCH_ACTION_UP,
+                                    .pointer_id = 0,
+                                    .x = mx,
+                                    .y = my,
+                                    .pressure = if (is_down) DEFAULT_PRESSURE else 0,
+                                },
+                            };
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+
         var ev = try parseInputJson(allocator, raw_json);
         switch (ev) {
             .touch => |*t| {

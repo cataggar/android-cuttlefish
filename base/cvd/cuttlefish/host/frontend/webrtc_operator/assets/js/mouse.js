@@ -17,29 +17,36 @@
 'use strict';
 
 function trackMouseEvents(dc, mouseElement) {
+  let mouseMode = false;
+
+  function setMode(active) {
+    mouseMode = !!active;
+    mouseElement.classList.toggle('active', mouseMode);
+    if (!mouseMode && document.pointerLockElement === mouseElement) {
+      document.exitPointerLock();
+    }
+    if (typeof dc.setMouseMode === 'function') {
+      dc.setMouseMode(mouseMode);
+    }
+    const videos = document.querySelectorAll('.device-display-video');
+    videos.forEach(v => {
+      v.style.cursor = mouseMode ? 'none' : '';
+    });
+  }
+
   function onMouseDown(evt) {
-    if (!document.pointerLockElement) {
-      mouseElement.requestPointerLock({});
-      return;
-    }
-    dc.sendMouseButton({button: evt.button, down: true});
+    evt.preventDefault();
+    setMode(!mouseMode);
   }
 
-  function onMouseUp(evt) {
-    if (document.pointerLockElement) {
-      dc.sendMouseButton({button: evt.button, down: false});
+  document.addEventListener('keydown', evt => {
+    if (evt.key === 'Escape' && mouseMode) {
+      setMode(false);
     }
-  }
+  });
 
-  function onMouseMove(evt) {
-    if (document.pointerLockElement) {
-      dc.sendMouseMove({x: evt.movementX, y: evt.movementY});
-      dc.sendMouseButton({button: evt.button, down: evt.buttons > 0});
-    }
-  }
   mouseElement.addEventListener('mousedown', onMouseDown);
-  mouseElement.addEventListener('mouseup', onMouseUp);
-  mouseElement.addEventListener('mousemove', onMouseMove);
+  mouseElement.addEventListener('contextmenu', evt => evt.preventDefault());
 }
 
 function enableMouseButton(dc) {
