@@ -306,7 +306,12 @@ class DeviceConnection {
       this.#displayState.canvasHeight = height;
       this.#displayState.mouseX = Math.round(width / 2);
       this.#displayState.mouseY = Math.round(height / 2);
-      const ctx = canvas.getContext('2d');
+      if (!canvas._ctx2d) {
+        canvas._ctx2d =
+            canvas.getContext('2d', {alpha: false, desynchronized: true}) ||
+            canvas.getContext('2d');
+      }
+      const ctx = canvas._ctx2d;
 
       const drawMouseCursor = () => {
         if (!this.#displayState.mouseActive) return;
@@ -372,7 +377,7 @@ class DeviceConnection {
         const fc = this.#displayState.frameCount;
 
         if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideoFrame) {
-          ctx.drawImage(this.#displayState.remoteVideoFrame, 0, 0, width, height);
+          canvas._ctx2d.drawImage(this.#displayState.remoteVideoFrame, 0, 0, width, height);
           if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
             const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
             const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
@@ -704,15 +709,19 @@ class DeviceConnection {
     if (!message || !message.data || typeof VideoDecoder === 'undefined') {
       return;
     }
-    let binStr;
+    let bytes;
     try {
-      binStr = atob(message.data);
+      if (typeof Uint8Array.fromBase64 === 'function') {
+        bytes = Uint8Array.fromBase64(message.data);
+      } else {
+        const binStr = atob(message.data);
+        bytes = new Uint8Array(binStr.length);
+        for (let i = 0; i < binStr.length; i++) {
+          bytes[i] = binStr.charCodeAt(i);
+        }
+      }
     } catch (_) {
       return;
-    }
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) {
-      bytes[i] = binStr.charCodeAt(i);
     }
 
     let sps = null;
@@ -805,6 +814,7 @@ class DeviceConnection {
           this.#displayState.videoDecoder.state === 'unconfigured') {
         this.#displayState.videoDecoder.configure({
           codec: targetCodec,
+          hardwareAcceleration: 'prefer-hardware',
           optimizeForLatency: true,
         });
         this.#displayState.videoDecoderCodec = targetCodec;
