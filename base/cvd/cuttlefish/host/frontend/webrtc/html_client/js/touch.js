@@ -18,11 +18,13 @@
 
 function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
   let activePointers = new Set();
+  let lastScaledCoords = new Map();
 
   function onPointerDown(e) {
     // Can't prevent event default behavior to allow the element gain focus
     // when touched and start capturing keyboard input in the parent.
     activePointers.add(e.pointerId);
+    lastScaledCoords.set(e.pointerId, scaleCoordinates(e.target, e.offsetX, e.offsetY));
     sendEventUpdate(dc, e.target, [{x: e.offsetX, y: e.offsetY, id: e.pointerId}], scaleCoordinates, true);
   }
 
@@ -30,6 +32,7 @@ function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
     // Can't prevent event default behavior to allow the element gain focus
     // when touched and start capturing keyboard input in the parent.
     const wasDown = activePointers.delete(e.pointerId);
+    lastScaledCoords.delete(e.pointerId);
     if (!wasDown) {
       return;
     }
@@ -43,6 +46,12 @@ function trackPointerEvents(touchInputElement, dc, scaleCoordinates) {
       // This is just a mouse move, not a drag
       return;
     }
+    const [xs, ys] = scaleCoordinates(e.target, e.offsetX, e.offsetY);
+    const prev = lastScaledCoords.get(e.pointerId);
+    if (prev && prev[0] === xs && prev[1] === ys) {
+      return;
+    }
+    lastScaledCoords.set(e.pointerId, [xs, ys]);
     sendEventUpdate(dc, e.target, [{x: e.offsetX, y: e.offsetY, id: e.pointerId}], scaleCoordinates, true);
   }
 

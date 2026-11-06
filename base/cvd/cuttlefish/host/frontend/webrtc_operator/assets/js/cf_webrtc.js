@@ -308,7 +308,7 @@ class DeviceConnection {
       this.#displayState.mouseY = Math.round(height / 2);
       if (!canvas._ctx2d) {
         canvas._ctx2d =
-            canvas.getContext('2d', {alpha: false, desynchronized: true}) ||
+            canvas.getContext('2d', {alpha: false}) ||
             canvas.getContext('2d');
       }
       const ctx = canvas._ctx2d;
@@ -348,10 +348,7 @@ class DeviceConnection {
       let frameLoadInFlight = false;
       const pollLiveFrame = () => {
         if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
-        if (this.#displayState.hasRemoteFrames &&
-            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 2000) {
-          return;
-        }
+        if (this.#displayState.lastH264FrameMs > 0) return;
         if (frameLoadInFlight) return;
         frameLoadInFlight = true;
         const img = new Image();
@@ -512,7 +509,7 @@ class DeviceConnection {
 
       if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         const forwardWindowKey = (e) => {
-          if (e.metaKey || e.ctrlKey) return;
+          if (e.defaultPrevented || e.metaKey || e.ctrlKey) return;
           const active = document.activeElement;
           const dd = document.getElementById('device-displays');
           if (active && dd && (active === dd || dd.contains(active))) {
