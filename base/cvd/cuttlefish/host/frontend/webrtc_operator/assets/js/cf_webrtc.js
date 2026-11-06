@@ -344,7 +344,7 @@ class DeviceConnection {
       const pollLiveFrame = () => {
         if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
         if (this.#displayState.hasRemoteFrames &&
-            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 10000) {
+            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 2000) {
           return;
         }
         if (frameLoadInFlight) return;
