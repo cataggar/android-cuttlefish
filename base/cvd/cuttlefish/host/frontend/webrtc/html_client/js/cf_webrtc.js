@@ -289,7 +289,7 @@ class DeviceConnection {
   initDisplayStreams(deviceInfo) {
     const displays = (deviceInfo && deviceInfo.displays && deviceInfo.displays.length > 0)
         ? deviceInfo.displays
-        : [{id: '0', width: 720, height: 1280, x_res: 720, y_res: 1280, dpi: 320, fps: 30}];
+        : [{id: '0', width: 720, height: 1280, x_res: 720, y_res: 1280, dpi: 320, fps: 60}];
     for (const disp of displays) {
       const dispId = disp.id !== undefined ? String(disp.id) : '0';
       const streamId = `display_${dispId}`;
@@ -297,7 +297,7 @@ class DeviceConnection {
 
       const width = Number(disp.width || disp.x_res || 720);
       const height = Number(disp.height || disp.y_res || 1280);
-      const fps = Number(disp.fps || 30);
+      const fps = Number(disp.fps || 60);
 
       const canvas = document.createElement('canvas');
       canvas.width = width;
@@ -344,7 +344,7 @@ class DeviceConnection {
       const pollLiveFrame = () => {
         if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
         if (this.#displayState.hasRemoteFrames &&
-            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 2000) {
+            (Date.now() - (this.#displayState.lastH264FrameMs || 0)) <= 10000) {
           return;
         }
         if (frameLoadInFlight) return;
@@ -496,7 +496,7 @@ class DeviceConnection {
         renderFrame();
       }, Math.max(16, Math.floor(1000 / fps)));
 
-      const stream = canvas.captureStream(fps);
+      const stream = canvas.captureStream();
       this.#streams[streamId] = stream;
       if (this.#streamPromiseResolvers[streamId]) {
         for (const resolver of this.#streamPromiseResolvers[streamId]) {
@@ -789,15 +789,29 @@ class DeviceConnection {
     const targetCodec = (sps && sps.length >= 4)
         ? `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`
         : (this.#displayState.videoDecoderCodec || 'avc1.42e01f');
+    const msgWidth = Number(message.width || 0);
+    const msgHeight = Number(message.height || 0);
+    const dimsChanged = msgWidth > 0 && msgHeight > 0 &&
+        (msgWidth !== this.#displayState.videoDecoderWidth ||
+         msgHeight !== this.#displayState.videoDecoderHeight);
 
     try {
+      if (dimsChanged && !isKey) {
+        this.#displayState.videoDecoderNeedsKey = true;
+      }
+
       if ((sps && targetCodec !== this.#displayState.videoDecoderCodec) ||
+          (isKey && dimsChanged) ||
           this.#displayState.videoDecoder.state === 'unconfigured') {
         this.#displayState.videoDecoder.configure({
           codec: targetCodec,
           optimizeForLatency: true,
         });
         this.#displayState.videoDecoderCodec = targetCodec;
+        if (msgWidth > 0 && msgHeight > 0) {
+          this.#displayState.videoDecoderWidth = msgWidth;
+          this.#displayState.videoDecoderHeight = msgHeight;
+        }
         this.#displayState.videoDecoderNeedsKey = true;
       }
 

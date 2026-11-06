@@ -1300,6 +1300,7 @@ pub const Agent = struct {
             if (rc < 0) {
                 const err = darwin_c.__error().*;
                 if (err != darwin_c.EAGAIN) return Error.RecvFailed;
+                if (!builtin.is_test) return null;
                 var pfd = [_]darwin_c.PollFd{.{
                     .fd = fd,
                     .events = darwin_c.POLLIN,
