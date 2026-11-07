@@ -345,41 +345,6 @@ class DeviceConnection {
         ctx.restore();
       };
 
-      let frameLoadInFlight = false;
-      const pollLiveFrame = () => {
-        if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
-        if (this.#displayState.lastH264FrameMs > 0 &&
-            (Date.now() - this.#displayState.lastH264FrameMs) < 2500) {
-          return;
-        }
-        if (frameLoadInFlight) return;
-        frameLoadInFlight = true;
-        const img = new Image();
-        img.onload = () => {
-          frameLoadInFlight = false;
-          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-            if (this.#displayState.lastH264FrameMs > 0 &&
-                (Date.now() - this.#displayState.lastH264FrameMs) >= 2500 &&
-                this.#displayState.remoteVideoFrame) {
-              try {
-                this.#displayState.remoteVideoFrame.close();
-              } catch (_) {}
-              this.#displayState.remoteVideoFrame = null;
-            }
-            this.#displayState.remoteImage = img;
-            this.#displayState.hasRemoteFrames = true;
-            renderFrame();
-          }
-        };
-        img.onerror = () => {
-          frameLoadInFlight = false;
-        };
-        img.src = `/live_frame.png?t=${performance.now()}`;
-      };
-      this.#displayState.pollLiveFrame = pollLiveFrame;
-      pollLiveFrame();
-      setInterval(pollLiveFrame, 250);
-
       const renderFrame = () => {
         this.#displayState.frameCount += 1;
         const fc = this.#displayState.frameCount;
@@ -403,23 +368,6 @@ class DeviceConnection {
 
         if (this.#displayState.hasRemoteFrames && this.#displayState.remoteVideo) {
           ctx.drawImage(this.#displayState.remoteVideo, 0, 0, width, height);
-          if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
-            const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
-            const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
-            ctx.beginPath();
-            ctx.arc(tx, ty, 28, 0, Math.PI * 2);
-            ctx.fillStyle = 'rgba(56, 189, 248, 0.40)';
-            ctx.fill();
-            ctx.lineWidth = 3;
-            ctx.strokeStyle = '#38bdf8';
-            ctx.stroke();
-          }
-          drawMouseCursor();
-          return;
-        }
-
-        if (this.#displayState.remoteImage && this.#displayState.remoteImage.naturalWidth > 0) {
-          ctx.drawImage(this.#displayState.remoteImage, 0, 0, width, height);
           if (this.#displayState.touchDown && !this.#displayState.mouseActive) {
             const tx = Math.max(16, Math.min(width - 16, this.#displayState.touchX));
             const ty = Math.max(16, Math.min(height - 16, this.#displayState.touchY));
@@ -822,7 +770,7 @@ class DeviceConnection {
           this.#displayState.videoDecoder.state === 'unconfigured') {
         this.#displayState.videoDecoder.configure({
           codec: targetCodec,
-          hardwareAcceleration: 'prefer-hardware',
+          hardwareAcceleration: 'prefer-software',
           optimizeForLatency: true,
         });
         this.#displayState.videoDecoderCodec = targetCodec;
@@ -868,13 +816,10 @@ class DeviceConnection {
     let scaledX = xArr;
     let scaledY = yArr;
     const rv = this.#displayState.remoteVideo;
-    const img = this.#displayState.remoteImage;
     const srcW = this.#displayState.videoFrameWidth ||
-        (rv && rv.videoWidth > 0 ? rv.videoWidth : 0) ||
-        (img && img.naturalWidth > 0 ? img.naturalWidth : 0);
+        (rv && rv.videoWidth > 0 ? rv.videoWidth : 0);
     const srcH = this.#displayState.videoFrameHeight ||
-        (rv && rv.videoHeight > 0 ? rv.videoHeight : 0) ||
-        (img && img.naturalHeight > 0 ? img.naturalHeight : 0);
+        (rv && rv.videoHeight > 0 ? rv.videoHeight : 0);
     const cw = this.#displayState.canvasWidth || 0;
     const ch = this.#displayState.canvasHeight || 0;
     if (srcW > 0 && srcH > 0 && cw > 0 && ch > 0 &&
