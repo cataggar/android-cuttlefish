@@ -348,13 +348,24 @@ class DeviceConnection {
       let frameLoadInFlight = false;
       const pollLiveFrame = () => {
         if (this.#displayState.remoteVideo && this.#displayState.hasRemoteFrames) return;
-        if (this.#displayState.lastH264FrameMs > 0) return;
+        if (this.#displayState.lastH264FrameMs > 0 &&
+            (Date.now() - this.#displayState.lastH264FrameMs) < 2500) {
+          return;
+        }
         if (frameLoadInFlight) return;
         frameLoadInFlight = true;
         const img = new Image();
         img.onload = () => {
           frameLoadInFlight = false;
           if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+            if (this.#displayState.lastH264FrameMs > 0 &&
+                (Date.now() - this.#displayState.lastH264FrameMs) >= 2500 &&
+                this.#displayState.remoteVideoFrame) {
+              try {
+                this.#displayState.remoteVideoFrame.close();
+              } catch (_) {}
+              this.#displayState.remoteVideoFrame = null;
+            }
             this.#displayState.remoteImage = img;
             this.#displayState.hasRemoteFrames = true;
             renderFrame();
